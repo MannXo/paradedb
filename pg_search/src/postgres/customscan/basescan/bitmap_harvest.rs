@@ -19,10 +19,9 @@
 //! bitmapqual covers quals we would otherwise evaluate as a `heap_filter`, so the
 //! index's TIDBitmap can be intersected with the Tantivy result set (#5702).
 //!
-//! Plan time: `collect_heap_expr_nodes` gathers the coverable quals, then `harvest`
-//! finds or builds a covering `BitmapHeapPath` — validated by `validate`, built by
-//! `build_bitmap_path` when the planner kept none — and the caller attaches it as a
-//! `custom_paths` child. Execution time: `consume_and_report` runs the planned child
+//! Plan time: `BitmapHarvester::new` gathers the coverable HeapExpr quals and
+//! `harvest` finds or builds a covering `BitmapHeapPath`, which the caller attaches as
+//! a `custom_paths` child. Execution time: `consume_and_report` runs the planned child
 //! `BitmapIndexScan` and inspects its TIDBitmap.
 //!
 //! Scope: a single `BitmapIndexScan` or `BitmapAnd` tree over top-level AND clauses;
@@ -37,72 +36,11 @@ use crate::postgres::customscan::qual_inspect::Qual;
 use crate::postgres::rel::PgSearchRelation;
 use pgrx::{PgList, pg_sys};
 
-/// Collect the expr nodes of every `Qual::HeapExpr` reachable through top-level AND
-/// structure. Returns `false` if a HeapExpr appears under OR/NOT, where its bitmap
-/// could not be used to reject rows.
-pub fn collect_heap_expr_nodes(qual: &Qual, out: &mut Vec<*mut pg_sys::Node>) -> bool {
-    match qual {
-        Qual::HeapExpr { expr_node, .. } => {
-            out.push(*expr_node);
-            true
-        }
-        Qual::And(qs) => qs.iter().all(|q| collect_heap_expr_nodes(q, out)),
-        Qual::Or(_) | Qual::Not(_) => !qual.contains_heap_expr(),
-        _ => true,
-    }
-}
-
-/// Find a `BitmapHeapPath` usable as an intersection source. Prefers one the planner
-/// kept in the rel's pathlists; falls back to building one, since a BitmapHeapPath only
-/// survives add_path competition when it beats every other path (usually seqscan) --
-/// absence does not mean no index applies.
-pub unsafe fn harvest(
+pub struct BitmapHarvester {
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     bm25_oid: pg_sys::Oid,
-    heap_exprs: &[*mut pg_sys::Node],
-) -> Option<*mut pg_sys::Path> {
-    unsafe {
-        let mut candidates: Vec<*mut pg_sys::BitmapHeapPath> =
-            PgList::<pg_sys::Path>::from_pg((*rel).pathlist)
-                .iter_ptr()
-                .chain(PgList::<pg_sys::Path>::from_pg((*rel).partial_pathlist).iter_ptr())
-                .filter(|path| (**path).type_ == pg_sys::NodeTag::T_BitmapHeapPath)
-                .map(|path| path.cast())
-                .collect();
-
-        if candidates.is_empty()
-            && let Some(bhp) = build_bitmap_path(root, rel, bm25_oid, heap_exprs)
-        {
-            candidates.push(bhp);
-        }
-
-        candidates
-            .into_iter()
-            .find_map(|bhp| match validate(bhp, bm25_oid, heap_exprs) {
-                Ok(clauses) => {
-                    for clause in &clauses {
-                        pgrx::notice!(
-                            "[bitmap_harvest] index={} lossy={} matched_heap_expr={}",
-                            clause.index_name,
-                            clause.lossy,
-                            clause.matched_heap_expr,
-                        );
-                    }
-                    pgrx::notice!(
-                        "[bitmap_harvest] harvested BitmapHeapPath: {} index clause(s), {} matched heap_filter clause(s), est rows={:.0}",
-                        clauses.len(),
-                        clauses.iter().filter(|c| c.matched_heap_expr).count(),
-                        (*bhp).path.rows,
-                    );
-                    Some(bhp.cast::<pg_sys::Path>())
-                }
-                Err(rejection) => {
-                    pgrx::notice!("[bitmap_harvest] skipping BitmapHeapPath: {rejection}");
-                    None
-                }
-            })
-    }
+    heap_exprs: Vec<*mut pg_sys::Node>,
 }
 
 struct HarvestedClause {
@@ -111,165 +49,249 @@ struct HarvestedClause {
     matched_heap_expr: bool,
 }
 
-/// Walk the candidate's bitmapqual tree, enforcing the module-level scope rules and
-/// classifying every `IndexClause` found along the way.
-unsafe fn validate(
-    bhp: *mut pg_sys::BitmapHeapPath,
-    bm25_oid: pg_sys::Oid,
-    heap_exprs: &[*mut pg_sys::Node],
-) -> Result<Vec<HarvestedClause>, &'static str> {
-    unsafe {
-        let mut clauses = Vec::new();
-        let mut pending = vec![(*bhp).bitmapqual];
-        while let Some(path) = pending.pop() {
-            match (*path).type_ {
-                pg_sys::NodeTag::T_BitmapAndPath => {
-                    let and_path: *mut pg_sys::BitmapAndPath = path.cast();
-                    pending.extend(
-                        PgList::<pg_sys::Path>::from_pg((*and_path).bitmapquals).iter_ptr(),
-                    );
+impl BitmapHarvester {
+    /// Collect the expr node of every `Qual::HeapExpr` reachable through top-level AND
+    /// structure. Returns `None` when there is nothing to cover, or when a HeapExpr
+    /// appears under OR/NOT, where its bitmap could not be used to reject rows.
+    pub fn new(
+        root: *mut pg_sys::PlannerInfo,
+        rel: *mut pg_sys::RelOptInfo,
+        bm25_oid: pg_sys::Oid,
+        quals: &Qual,
+    ) -> Option<Self> {
+        fn collect(qual: &Qual, out: &mut Vec<*mut pg_sys::Node>) -> bool {
+            match qual {
+                Qual::HeapExpr { expr_node, .. } => {
+                    out.push(*expr_node);
+                    true
                 }
-                pg_sys::NodeTag::T_IndexPath => {
-                    let ip: *mut pg_sys::IndexPath = path.cast();
-                    let indexoid = (*(*ip).indexinfo).indexoid;
-                    if indexoid == bm25_oid {
-                        return Err("bitmapqual is over the BM25 index itself");
-                    }
-                    let index_name = PgSearchRelation::open(indexoid).name().to_string();
-                    for iclause in
-                        PgList::<pg_sys::IndexClause>::from_pg((*ip).indexclauses).iter_ptr()
-                    {
-                        let clause = (*(*iclause).rinfo).clause;
-                        clauses.push(HarvestedClause {
-                            index_name: index_name.clone(),
-                            lossy: (*iclause).lossy,
-                            matched_heap_expr: heap_exprs
-                                .iter()
-                                .any(|expr| pg_sys::equal(clause.cast(), (*expr).cast())),
-                        });
-                    }
-                }
-                _ => return Err("bitmapqual contains BitmapOr"),
+                Qual::And(qs) => qs.iter().all(|q| collect(q, out)),
+                Qual::Or(_) | Qual::Not(_) => !qual.contains_heap_expr(),
+                _ => true,
             }
         }
 
-        if clauses.iter().any(|c| c.matched_heap_expr) {
-            Ok(clauses)
-        } else {
-            Err("covers no heap_filter clause")
+        let mut heap_exprs = Vec::new();
+        if !collect(quals, &mut heap_exprs) || heap_exprs.is_empty() {
+            return None;
         }
+        Some(Self {
+            root,
+            rel,
+            bm25_oid,
+            heap_exprs,
+        })
     }
-}
 
-/// Build a `BitmapHeapPath` over the first non-BM25 index with at least one key column
-/// matching a HeapExpr clause.
-unsafe fn build_bitmap_path(
-    root: *mut pg_sys::PlannerInfo,
-    rel: *mut pg_sys::RelOptInfo,
-    bm25_oid: pg_sys::Oid,
-    heap_exprs: &[*mut pg_sys::Node],
-) -> Option<*mut pg_sys::BitmapHeapPath> {
-    unsafe {
-        for ioi in PgList::<pg_sys::IndexOptInfo>::from_pg((*rel).indexlist).iter_ptr() {
-            if (*ioi).indexoid == bm25_oid || !(*ioi).amhasgetbitmap {
-                continue;
-            }
-            // Partial indexes need predicate-implication checks.
-            if !(*ioi).indpred.is_null() {
-                continue;
-            }
+    /// Find a `BitmapHeapPath` usable as an intersection source. Prefers one the
+    /// planner kept in the rel's pathlists; falls back to building one, since a
+    /// BitmapHeapPath only survives add_path competition when it beats every other path
+    /// (usually seqscan) -- absence does not mean no index applies.
+    pub unsafe fn harvest(&self) -> Option<*mut pg_sys::Path> {
+        unsafe {
+            let mut candidates: Vec<*mut pg_sys::BitmapHeapPath> =
+                PgList::<pg_sys::Path>::from_pg((*self.rel).pathlist)
+                    .iter_ptr()
+                    .chain(PgList::<pg_sys::Path>::from_pg((*self.rel).partial_pathlist).iter_ptr())
+                    .filter(|path| (**path).type_ == pg_sys::NodeTag::T_BitmapHeapPath)
+                    .map(|path| path.cast())
+                    .collect();
 
-            let mut iclauses = PgList::<pg_sys::IndexClause>::new();
-            for ri in PgList::<pg_sys::RestrictInfo>::from_pg((*ioi).indrestrictinfo).iter_ptr() {
-                let clause = (*ri).clause;
-                if heap_exprs
-                    .iter()
-                    .any(|expr| pg_sys::equal(clause.cast(), (*expr).cast()))
-                    && let Some(iclause) = match_clause_to_index(ri, ioi)
-                {
-                    iclauses.push(iclause);
-                }
-            }
-            if iclauses.is_empty() {
-                continue;
-            }
-
-            pgrx::notice!(
-                "[bitmap_harvest] directly built IndexPath over {} with {} clause(s)",
-                PgSearchRelation::open((*ioi).indexoid).name(),
-                iclauses.len()
-            );
-            let ipath = pg_sys::create_index_path(
-                root,
-                ioi,
-                iclauses.into_pg(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                pg_sys::ScanDirection::ForwardScanDirection,
-                false,
-                std::ptr::null_mut(),
-                1.0,
-                false,
-            );
-            let bhp = pg_sys::create_bitmap_heap_path(
-                root,
-                rel,
-                ipath.cast(),
-                (*rel).lateral_relids,
-                1.0,
-                0,
-            );
-            return Some(bhp);
-        }
-        None
-    }
-}
-
-/// Mirror of the direct-match arm of core's `match_opclause_to_indexcol`: accepts
-/// `indexkey OP pseudoconstant` with the operator in the key column's opfamily. Clauses
-/// needing support-function derivation (LIKE prefix, PostGIS ST_DWithin) are not yet
-/// matched.
-unsafe fn match_clause_to_index(
-    ri: *mut pg_sys::RestrictInfo,
-    ioi: *mut pg_sys::IndexOptInfo,
-) -> Option<*mut pg_sys::IndexClause> {
-    unsafe {
-        let clause = (*ri).clause.cast::<pg_sys::Node>();
-        if (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
-            return None;
-        }
-        let opexpr = clause.cast::<pg_sys::OpExpr>();
-        let args = PgList::<pg_sys::Node>::from_pg((*opexpr).args);
-        if args.len() != 2 {
-            return None;
-        }
-        let (mut leftop, rightop) = (args.get_ptr(0)?, args.get_ptr(1)?);
-        if (*leftop).type_ == pg_sys::NodeTag::T_RelabelType {
-            leftop = (*leftop.cast::<pg_sys::RelabelType>()).arg.cast();
-        }
-        if pg_sys::contain_var_clause(rightop) || pg_sys::contain_volatile_functions(rightop) {
-            return None;
-        }
-
-        for indexcol in 0..(*ioi).nkeycolumns {
-            if pg_sys::match_index_to_operand(leftop, indexcol, ioi)
-                && pg_sys::op_in_opfamily((*opexpr).opno, *(*ioi).opfamily.add(indexcol as usize))
+            if candidates.is_empty()
+                && let Some(bhp) = self.build_bitmap_path()
             {
-                let iclause: *mut pg_sys::IndexClause =
-                    pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexClause>()).cast();
-                (*iclause).type_ = pg_sys::NodeTag::T_IndexClause;
-                (*iclause).rinfo = ri;
-                let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
-                indexquals.push(ri);
-                (*iclause).indexquals = indexquals.into_pg();
-                (*iclause).lossy = false;
-                (*iclause).indexcol = indexcol as _;
-                (*iclause).indexcols = std::ptr::null_mut();
-                return Some(iclause);
+                candidates.push(bhp);
+            }
+
+            candidates
+                .into_iter()
+                .find_map(|bhp| match self.validate(bhp) {
+                    Ok(clauses) => {
+                        for clause in &clauses {
+                            pgrx::notice!(
+                                "[bitmap_harvest] index={} lossy={} matched_heap_expr={}",
+                                clause.index_name,
+                                clause.lossy,
+                                clause.matched_heap_expr,
+                            );
+                        }
+                        pgrx::notice!(
+                            "[bitmap_harvest] harvested BitmapHeapPath: {} index clause(s), {} matched heap_filter clause(s), est rows={:.0}",
+                            clauses.len(),
+                            clauses.iter().filter(|c| c.matched_heap_expr).count(),
+                            (*bhp).path.rows,
+                        );
+                        Some(bhp.cast::<pg_sys::Path>())
+                    }
+                    Err(rejection) => {
+                        pgrx::notice!("[bitmap_harvest] skipping BitmapHeapPath: {rejection}");
+                        None
+                    }
+                })
+        }
+    }
+
+    /// Walk the candidate's bitmapqual tree, enforcing the module-level scope rules and
+    /// classifying every `IndexClause` found along the way.
+    unsafe fn validate(
+        &self,
+        bhp: *mut pg_sys::BitmapHeapPath,
+    ) -> Result<Vec<HarvestedClause>, &'static str> {
+        unsafe {
+            let mut clauses = Vec::new();
+            let mut pending = vec![(*bhp).bitmapqual];
+            while let Some(path) = pending.pop() {
+                match (*path).type_ {
+                    pg_sys::NodeTag::T_BitmapAndPath => {
+                        let and_path: *mut pg_sys::BitmapAndPath = path.cast();
+                        pending.extend(
+                            PgList::<pg_sys::Path>::from_pg((*and_path).bitmapquals).iter_ptr(),
+                        );
+                    }
+                    pg_sys::NodeTag::T_IndexPath => {
+                        let ip: *mut pg_sys::IndexPath = path.cast();
+                        let indexoid = (*(*ip).indexinfo).indexoid;
+                        if indexoid == self.bm25_oid {
+                            return Err("bitmapqual is over the BM25 index itself");
+                        }
+                        let index_name = PgSearchRelation::open(indexoid).name().to_string();
+                        for iclause in
+                            PgList::<pg_sys::IndexClause>::from_pg((*ip).indexclauses).iter_ptr()
+                        {
+                            clauses.push(HarvestedClause {
+                                index_name: index_name.clone(),
+                                lossy: (*iclause).lossy,
+                                matched_heap_expr: self
+                                    .matches_heap_expr((*(*iclause).rinfo).clause.cast()),
+                            });
+                        }
+                    }
+                    _ => return Err("bitmapqual contains BitmapOr"),
+                }
+            }
+
+            if clauses.iter().any(|c| c.matched_heap_expr) {
+                Ok(clauses)
+            } else {
+                Err("covers no heap_filter clause")
             }
         }
-        None
+    }
+
+    /// Build a `BitmapHeapPath` over the first non-BM25 index with at least one key
+    /// column matching a HeapExpr clause.
+    unsafe fn build_bitmap_path(&self) -> Option<*mut pg_sys::BitmapHeapPath> {
+        unsafe {
+            for ioi in PgList::<pg_sys::IndexOptInfo>::from_pg((*self.rel).indexlist).iter_ptr() {
+                if (*ioi).indexoid == self.bm25_oid || !(*ioi).amhasgetbitmap {
+                    continue;
+                }
+                // Partial indexes need predicate-implication checks.
+                if !(*ioi).indpred.is_null() {
+                    continue;
+                }
+
+                let mut iclauses = PgList::<pg_sys::IndexClause>::new();
+                for ri in PgList::<pg_sys::RestrictInfo>::from_pg((*ioi).indrestrictinfo).iter_ptr()
+                {
+                    if self.matches_heap_expr((*ri).clause.cast())
+                        && let Some(iclause) = Self::match_clause_to_index(ri, ioi)
+                    {
+                        iclauses.push(iclause);
+                    }
+                }
+                if iclauses.is_empty() {
+                    continue;
+                }
+
+                pgrx::notice!(
+                    "[bitmap_harvest] directly built IndexPath over {} with {} clause(s)",
+                    PgSearchRelation::open((*ioi).indexoid).name(),
+                    iclauses.len()
+                );
+                let ipath = pg_sys::create_index_path(
+                    self.root,
+                    ioi,
+                    iclauses.into_pg(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    pg_sys::ScanDirection::ForwardScanDirection,
+                    false,
+                    std::ptr::null_mut(),
+                    1.0,
+                    false,
+                );
+                let bhp = pg_sys::create_bitmap_heap_path(
+                    self.root,
+                    self.rel,
+                    ipath.cast(),
+                    (*self.rel).lateral_relids,
+                    1.0,
+                    0,
+                );
+                return Some(bhp);
+            }
+            None
+        }
+    }
+
+    /// Mirror of the direct-match arm of core's `match_opclause_to_indexcol`: accepts
+    /// `indexkey OP pseudoconstant` with the operator in the key column's opfamily.
+    /// Clauses needing support-function derivation (LIKE prefix, PostGIS ST_DWithin)
+    /// are not yet matched.
+    unsafe fn match_clause_to_index(
+        ri: *mut pg_sys::RestrictInfo,
+        ioi: *mut pg_sys::IndexOptInfo,
+    ) -> Option<*mut pg_sys::IndexClause> {
+        unsafe {
+            let clause = (*ri).clause.cast::<pg_sys::Node>();
+            if (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
+                return None;
+            }
+            let opexpr = clause.cast::<pg_sys::OpExpr>();
+            let args = PgList::<pg_sys::Node>::from_pg((*opexpr).args);
+            if args.len() != 2 {
+                return None;
+            }
+            let (mut leftop, rightop) = (args.get_ptr(0)?, args.get_ptr(1)?);
+            if (*leftop).type_ == pg_sys::NodeTag::T_RelabelType {
+                leftop = (*leftop.cast::<pg_sys::RelabelType>()).arg.cast();
+            }
+            if pg_sys::contain_var_clause(rightop) || pg_sys::contain_volatile_functions(rightop) {
+                return None;
+            }
+
+            for indexcol in 0..(*ioi).nkeycolumns {
+                if pg_sys::match_index_to_operand(leftop, indexcol, ioi)
+                    && pg_sys::op_in_opfamily(
+                        (*opexpr).opno,
+                        *(*ioi).opfamily.add(indexcol as usize),
+                    )
+                {
+                    let iclause: *mut pg_sys::IndexClause =
+                        pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexClause>()).cast();
+                    (*iclause).type_ = pg_sys::NodeTag::T_IndexClause;
+                    (*iclause).rinfo = ri;
+                    let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
+                    indexquals.push(ri);
+                    (*iclause).indexquals = indexquals.into_pg();
+                    (*iclause).lossy = false;
+                    (*iclause).indexcol = indexcol as _;
+                    (*iclause).indexcols = std::ptr::null_mut();
+                    return Some(iclause);
+                }
+            }
+            None
+        }
+    }
+
+    unsafe fn matches_heap_expr(&self, clause: *mut pg_sys::Node) -> bool {
+        unsafe {
+            self.heap_exprs
+                .iter()
+                .any(|expr| pg_sys::equal(clause.cast(), (*expr).cast()))
+        }
     }
 }
 

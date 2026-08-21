@@ -753,16 +753,13 @@ impl CustomScan for BaseScan {
                 return None;
             }
 
-            let harvested_bitmap_path = {
-                let mut heap_exprs = Vec::new();
-                if bitmap_harvest::collect_heap_expr_nodes(&quals, &mut heap_exprs)
-                    && !heap_exprs.is_empty()
-                {
-                    bitmap_harvest::harvest(root, builder.args().rel, bm25_index.oid(), &heap_exprs)
-                } else {
-                    None
-                }
-            };
+            let harvested_bitmap_path = bitmap_harvest::BitmapHarvester::new(
+                root,
+                builder.args().rel,
+                bm25_index.oid(),
+                &quals,
+            )
+            .and_then(|harvester| harvester.harvest());
 
             //
             // ===================
