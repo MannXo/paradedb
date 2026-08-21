@@ -41,23 +41,13 @@ use pgrx::{PgList, pg_sys};
 /// structure. Returns `false` if a HeapExpr appears under OR/NOT, where its bitmap
 /// could not be used to reject rows.
 pub fn collect_heap_expr_nodes(qual: &Qual, out: &mut Vec<*mut pg_sys::Node>) -> bool {
-    fn contains_heap_expr(qual: &Qual) -> bool {
-        match qual {
-            Qual::HeapExpr { .. } => true,
-            Qual::And(qs) | Qual::Or(qs) => qs.iter().any(contains_heap_expr),
-            Qual::Not(q) => contains_heap_expr(q),
-            _ => false,
-        }
-    }
-
     match qual {
         Qual::HeapExpr { expr_node, .. } => {
             out.push(*expr_node);
             true
         }
         Qual::And(qs) => qs.iter().all(|q| collect_heap_expr_nodes(q, out)),
-        Qual::Or(qs) => !qs.iter().any(contains_heap_expr),
-        Qual::Not(q) => !contains_heap_expr(q),
+        Qual::Or(_) | Qual::Not(_) => !qual.contains_heap_expr(),
         _ => true,
     }
 }
