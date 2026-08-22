@@ -23,8 +23,8 @@
 //! only assign against them (at commit and merge, inside tantivy). This
 //! module owns the training side: a reservoir sampler fed by the
 //! CREATE INDEX heap scan, the hierarchical-superkmeans run per vector
-//! field, and the [`CentroidIndex`] provider handed to
-//! `IndexBuilder::centroid_index`.
+//! field, and the [`CentroidProducer`](tantivy::vector::CentroidProducer)
+//! implementation handed to `IndexBuilder::centroid_producer`.
 
 use crate::api::HashMap;
 use crate::postgres::options::BM25IndexOptions;

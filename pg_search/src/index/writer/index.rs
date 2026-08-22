@@ -711,15 +711,19 @@ mod tests {
 
     #[pg_test]
     fn test_index_writer_max_docs_per_segment() {
-        let relation_oid = get_relation_oid(true);
-        let config = IndexWriterConfig::new(NonZeroUsize::new(15 * 1024 * 1024).unwrap());
+        let relation_oid = get_relation_oid(false);
+        let mut config = IndexWriterConfig::new(NonZeroUsize::new(15 * 1024 * 1024).unwrap());
+        config.max_docs_per_segment = Some(DEFAULT_MAX_DOCS_PER_SEGMENT);
         let segment_ids = simulate_index_writer(config, relation_oid, 25000);
         assert_eq!(segment_ids.len(), 25);
     }
 
     #[pg_test]
-    fn test_index_writer_max_docs_per_segment_requires_vector_field() {
-        let relation_oid = get_relation_oid(false);
+    fn test_index_writer_vector_fields_do_not_cap_segments() {
+        // Segments assign against the index-level centroid index at any
+        // size, so a vector field no longer forces a per-segment doc cap;
+        // flushes stay memory-driven like every other schema.
+        let relation_oid = get_relation_oid(true);
         let config = IndexWriterConfig::new(NonZeroUsize::new(15 * 1024 * 1024).unwrap());
         let segment_ids = simulate_index_writer(config, relation_oid, 25000);
         assert_eq!(segment_ids.len(), 2);
