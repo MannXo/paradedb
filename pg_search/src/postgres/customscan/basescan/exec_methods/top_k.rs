@@ -201,15 +201,17 @@ impl TopKScanExecState {
         }
     }
 
-    /// For a parallel VECTOR scan: ensure this participant's units are
-    /// claimed — one atomic [`VectorScanWork::claim`] per unit (the whole
-    /// clustered chunk or one flat segment) until the pool is empty — and
-    /// return the tier-tagged claims. `None` for serial or non-vector
-    /// scans.
-    fn claim_vector_work(
+    /// For a parallel VECTOR scan: a claim SOURCE the search pulls units
+    /// from ONE AT A TIME — the search claims the next unit only after
+    /// finishing the previous one's work, which is what load-balances the
+    /// units across participants (a one-shot drain would let the leader,
+    /// which starts first, take everything). Each unit is recorded so
+    /// re-queries replay the same claims instead of re-claiming. `None`
+    /// for serial or non-vector scans.
+    fn vector_claim_source(
         &self,
         parallel_state: Option<*mut ParallelScanState>,
-    ) -> Option<Vec<VectorClaim>> {
+    ) -> Option<Box<dyn FnMut() -> Option<VectorClaim> + '_>> {
         let parallel_state = parallel_state?;
         let is_vector = self
             .orderby_info
@@ -219,20 +221,28 @@ impl TopKScanExecState {
         if !is_vector {
             return None;
         }
-        if self.vector_claims.borrow().is_none() {
-            let mut claims = Vec::new();
-            loop {
-                check_for_interrupts!();
-                match unsafe { VectorScanWork::claim(parallel_state) } {
-                    Some(claim) => claims.push(claim),
-                    None => break,
-                }
-            }
-            *self.claimed_segments.borrow_mut() =
-                Some(claims.iter().flat_map(VectorClaim::segment_ids).collect());
-            *self.vector_claims.borrow_mut() = Some(claims);
+        if let Some(recorded) = self.vector_claims.borrow().clone() {
+            // Re-query (visibility re-check / bigger limit): replay.
+            let mut recorded = recorded.into_iter();
+            return Some(Box::new(move || recorded.next()));
         }
-        self.vector_claims.borrow().clone()
+        *self.vector_claims.borrow_mut() = Some(Vec::new());
+        *self.claimed_segments.borrow_mut() = Some(Vec::new());
+        Some(Box::new(move || {
+            check_for_interrupts!();
+            let claim = unsafe { VectorScanWork::claim(parallel_state) }?;
+            self.vector_claims
+                .borrow_mut()
+                .as_mut()
+                .expect("recording initialized above")
+                .push(claim.clone());
+            self.claimed_segments
+                .borrow_mut()
+                .as_mut()
+                .expect("recording initialized above")
+                .extend(claim.segment_ids());
+            Some(claim)
+        }))
     }
 
     fn prepare_aggregations(&self, state: &mut BaseScanState) -> Option<PreparedAggregations> {
@@ -439,10 +449,11 @@ impl ExecMethod for TopKScanExecState {
             } else {
                 None
             };
-            // A parallel vector scan claims its units up front (the
-            // clustered chunk / single flat segments); the claims also
-            // tell the search which CollectorMode to hand tantivy.
-            let vector_claims = self.claim_vector_work(state.parallel_state());
+            // A parallel vector scan pulls its units of work (the
+            // clustered chunk / single flat segments) from this source as
+            // it goes; each unit becomes one collect_ivf / collect_flat
+            // call.
+            let mut vector_claims = self.vector_claim_source(state.parallel_state());
             let TopKSearch {
                 results,
                 segment_info,
@@ -461,7 +472,7 @@ impl ExecMethod for TopKScanExecState {
                     self.offset,
                     maybe_aux_collector,
                     maybe_parallel_state,
-                    vector_claims.as_deref(),
+                    vector_claims.as_deref_mut(),
                 );
             // Per-segment Fruit JSON → local ScanTelemetry. Workers publish into
             // DSM once at EndCustomScan; the leader merges at Shutdown.

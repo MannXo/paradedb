@@ -153,23 +153,29 @@ impl From<TopKSearchResults> for TopKSearch {
 
 /// The global probe loop's instrumentation, as the EXPLAIN-facing JSON.
 /// Drives one participant's vector search through the collector's
-/// explicit API: each claimed unit maps 1:1 onto a call — the clustered
-/// chunk to `collect_ivf`, a flat segment to `collect_flat` — and
-/// `merge` folds the fruits. Without claims (serial), the collector's
-/// own partition-everything `search` runs.
+/// explicit API. Units are pulled from `claims` ONE AT A TIME, and each
+/// maps 1:1 onto a call — the clustered chunk to `collect_ivf`, a flat
+/// segment to `collect_flat` — so the next unit is claimed only after
+/// the previous one's work is done: while one participant is inside the
+/// chunk, the others drain the flat units. `merge` folds the fruits.
+/// Without a claim source (serial), the collector's own
+/// partition-everything `search` runs.
 struct RunVectorSearch<'a> {
     searcher: &'a tantivy::Searcher,
     query: &'a dyn tantivy::query::Query,
-    claims: Option<&'a [VectorClaim]>,
 }
 
 impl RunVectorSearch<'_> {
-    fn run<T, S>(&self, collector: TopDocsByVectorSimilarity<T, S>) -> VectorSimilarityFruit
+    fn run<T, S>(
+        &self,
+        collector: TopDocsByVectorSimilarity<T, S>,
+        claims: Option<&mut (dyn FnMut() -> Option<VectorClaim> + '_)>,
+    ) -> VectorSimilarityFruit
     where
         T: tantivy::vector::VectorElement,
         S: tantivy::collector::SortKeyComputer + Send + Sync + 'static,
     {
-        let Some(claims) = self.claims else {
+        let Some(claims) = claims else {
             return collector
                 .search(self.searcher, self.query)
                 .expect("search should not fail");
@@ -182,9 +188,9 @@ impl RunVectorSearch<'_> {
                 .map(|ordinal| ordinal as tantivy::SegmentOrdinal)
                 .expect("claimed segment must exist in the searcher's snapshot")
         };
-        let fruits = claims
-            .iter()
-            .map(|claim| match claim {
+        let mut fruits = Vec::new();
+        while let Some(claim) = claims() {
+            fruits.push(match claim {
                 VectorClaim::Clustered(ids) => {
                     let ordinals: Vec<tantivy::SegmentOrdinal> =
                         ids.iter().copied().map(ordinal_of).collect();
@@ -193,10 +199,10 @@ impl RunVectorSearch<'_> {
                         .expect("search should not fail")
                 }
                 VectorClaim::Flat(id) => collector
-                    .collect_flat(self.searcher, self.query, ordinal_of(*id))
+                    .collect_flat(self.searcher, self.query, ordinal_of(id))
                     .expect("search should not fail"),
-            })
-            .collect();
+            });
+        }
         collector.merge(fruits)
     }
 }
@@ -953,7 +959,7 @@ impl SearchIndexReader {
         offset: usize,
         aux_collector: Option<TopKAuxiliaryCollector>,
         parallel_state_holding_shared_threshold: Option<*mut crate::postgres::ParallelScanState>,
-        vector_claims: Option<&[VectorClaim]>,
+        vector_claims: Option<&mut (dyn FnMut() -> Option<VectorClaim> + '_)>,
     ) -> TopKSearch {
         let (first_orderby_info, erased_features) = self.prepare_features(orderby_info);
         match first_orderby_info {
@@ -1147,14 +1153,17 @@ impl SearchIndexReader {
                 let run = RunVectorSearch {
                     searcher: &self.searcher,
                     query: &self.query,
-                    claims: vector_claims,
                 };
+                let claims = vector_claims;
                 let fruit = match tie_break_count {
-                    0 => run.run(collector),
-                    1 => run.run(collector.with_tie_break(next())),
-                    2 => run.run(collector.with_tie_break((next(), next()))),
-                    3 => run.run(collector.with_tie_break((next(), next(), next()))),
-                    4 => run.run(collector.with_tie_break((next(), next(), next(), next()))),
+                    0 => run.run(collector, claims),
+                    1 => run.run(collector.with_tie_break(next()), claims),
+                    2 => run.run(collector.with_tie_break((next(), next())), claims),
+                    3 => run.run(collector.with_tie_break((next(), next(), next())), claims),
+                    4 => run.run(
+                        collector.with_tie_break((next(), next(), next(), next())),
+                        claims,
+                    ),
                     x => panic!(
                         "Unsupported sort-field count: {}. At most {MAX_TOPK_FEATURES} are supported.",
                         x + 1
