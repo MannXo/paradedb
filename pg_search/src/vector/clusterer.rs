@@ -93,9 +93,9 @@ struct SampledField {
 }
 
 /// Uniform reservoir sampler over the CREATE INDEX heap scan, one
-/// reservoir per vector field. Capacity is bounded by
-/// `maintenance_work_mem` (half of it, split across vector fields) — the
-/// same knob pgvector builds are sized with.
+/// reservoir per vector field, held entirely in memory: capacity is
+/// `sample_fraction` of the rows seen (no memory cap), so the resident
+/// bytes are `rows * sample_fraction * dim * 4` per field.
 pub struct VectorSampler {
     fields: Vec<SampledField>,
     /// `centroid_ratio * training_samples_per_centroid`: the fraction of
@@ -145,7 +145,23 @@ impl VectorSampler {
     }
 
     /// Offer one heap row (the build callback's `values`/`isnull` arrays,
-    /// in index-column order) to every field's reservoir.
+    /// in index-column order) to every field's reservoir. Called once per
+    /// row from CREATE INDEX's heap-scan callback; sampling decides which
+    /// INCOMING rows get kept — the reservoir is never drawn from until
+    /// training, when its contents ARE the training set.
+    ///
+    /// Per vector-bearing row, one of two things happens:
+    /// * spare capacity → the row is appended (kept unconditionally);
+    /// * at capacity → the row plays the Algorithm-R lottery: with
+    ///   probability `cap / (seen + 1)` it evicts a uniformly-random
+    ///   resident, otherwise it is dropped.
+    ///
+    /// Because capacity grows with the stream (`cap = sample_fraction *
+    /// seen`), the two phases interleave for the whole scan — at the
+    /// default fraction roughly one in three arrivals lands in a freshly
+    /// opened slot, the rest face the lottery — and the reservoir
+    /// converges on `num_centroids * training_samples_per_centroid` rows
+    /// without knowing the row count up front.
     ///
     /// # Safety
     ///
