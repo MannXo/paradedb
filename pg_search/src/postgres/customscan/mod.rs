@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 pub mod aggregatescan;
 pub mod basescan;
 mod builders;
+pub mod collation_semantics;
 pub mod datafusion;
 pub mod dsm;
 pub mod exec;
@@ -299,7 +300,6 @@ pub struct JoinPathlistHookArgs {
 #[derive(Debug, Clone, Copy)]
 pub struct CreateUpperPathsHookArgs {
     pub root: *mut pg_sys::PlannerInfo,
-    #[allow(dead_code)]
     pub stage: pg_sys::UpperRelationKind::Type,
     pub input_rel: *mut pg_sys::RelOptInfo,
     pub output_rel: *mut pg_sys::RelOptInfo,

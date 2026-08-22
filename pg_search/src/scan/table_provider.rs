@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::HashSet;
 use crate::index::fast_fields_helper::{CanonicalColumn, FFHelper, WhichFastField};
-use crate::index::mvcc::MvccSatisfies;
+use crate::index::mvcc::{MvccSatisfies, SegmentView};
 use crate::index::reader::index::SearchIndexReader;
 use crate::postgres::ParallelScanState;
 use crate::postgres::heap::VisibilityChecker;
@@ -123,6 +123,12 @@ pub struct PgSearchTableProvider {
     /// Explicit range partitioning configuration. When present, the provider
     /// ignores parallel state segments and yields statically partitioned streams.
     range_sample: Option<RangePartitioningSample>,
+
+    /// The segment view this source's reader replays, for an MPP source whose workers resolve
+    /// the addresses it packs. Backend-local (a plan's readers do not travel), so re-injected
+    /// by the codec on deserialization, keyed by `source_idx`.
+    #[serde(skip)]
+    segment_view: Option<SegmentView>,
 }
 
 mod atomic_bool_serde {
@@ -162,6 +168,7 @@ impl Clone for PgSearchTableProvider {
             ),
             source_idx: self.source_idx,
             range_sample: self.range_sample.clone(),
+            segment_view: self.segment_view.clone(),
         }
     }
 }
@@ -187,6 +194,7 @@ impl PgSearchTableProvider {
             late_materialization_active: AtomicBool::new(false),
             source_idx,
             range_sample: None,
+            segment_view: None,
         }
     }
 
@@ -225,6 +233,10 @@ impl PgSearchTableProvider {
 
     pub(crate) fn source_idx(&self) -> Option<usize> {
         self.source_idx
+    }
+
+    pub(crate) fn set_segment_view(&mut self, view: SegmentView) {
+        self.segment_view = Some(view);
     }
 
     fn enable_deferred_columns(&mut self, required_early_columns: &HashSet<String>) {
@@ -283,6 +295,15 @@ impl PgSearchTableProvider {
 
     pub(crate) fn visibility_mode(&self) -> VisibilityMode {
         self.visibility_mode
+    }
+
+    pub fn add_match_tag_column(&mut self, tag_name: &str) {
+        if !self.fields.iter().any(|f| f.name() == tag_name) {
+            self.fields
+                .push(WhichFastField::MatchTag(tag_name.to_string()));
+            self.schema = OnceLock::new();
+            self.late_materialization_schema = OnceLock::new();
+        }
     }
 
     /// Returns the JoinScan source identity when visibility has been deferred.
@@ -406,16 +427,15 @@ impl PgSearchTableProvider {
         // applied at the base relation level. The filters we analyze here are join-level
         // predicates that couldn't be applied earlier - they are different predicates,
         // not duplicates.
-        FilterAnalyzer::new(&self.fields, self.scan_info.indexrelid)
+        FilterAnalyzer::new(&self.fields)
     }
 
     /// Combine the base query with any pushed-down filters.
     ///
     /// The base query comes from scan_info.query (single-table predicates from baserestrictinfo).
     /// The filters come from DataFusion's supports_filters_pushdown mechanism - these are
-    /// join-level predicates that couldn't be applied at the base relation level, including:
-    /// - SearchPredicateUDF: @@@ predicates from cross-table conditions
-    /// - Regular SQL predicates: equality, range, IN list on indexed columns
+    /// join-level predicates that couldn't be applied at the base relation level (e.g. regular
+    /// SQL predicates: equality, range, IN list on indexed columns).
     fn combine_query_with_filters(
         &self,
         base_query: SearchQueryInput,
@@ -461,19 +481,29 @@ impl PgSearchTableProvider {
             Some(ffhelper)
         };
 
-        Ok(Arc::new(PgSearchScanPlan::new(
-            state,
-            schema,
-            resolved_query,
-            None,
-            deferred,
-            ffhelper_arg,
-            self.scan_info.indexrelid.to_u32(),
-            deferred_ctid_plan_position,
-            partition_count,
-            parallel_state,
-            self.range_sample.clone(),
-        )))
+        let table_alias = self.scan_info.alias.clone().unwrap_or_else(|| {
+            match self.deferred_ctid_plan_position() {
+                Some(pos) => format!("source_{pos}"),
+                None => format!("table_{}", self.scan_info.heaprelid),
+            }
+        });
+
+        Ok(Arc::new(
+            PgSearchScanPlan::new(
+                state,
+                schema,
+                resolved_query,
+                None,
+                deferred,
+                ffhelper_arg,
+                self.scan_info.indexrelid.to_u32(),
+                deferred_ctid_plan_position,
+                partition_count,
+                parallel_state,
+                self.range_sample.clone(),
+            )
+            .with_table_alias(table_alias),
+        ))
     }
 
     /// Creates a single-partition `PgSearchScanPlan` for lazy scans.
@@ -509,6 +539,11 @@ impl PgSearchTableProvider {
             heap_relid: heap_relid.into(),
             batch_size_hint: None,
             score_needed: self.scan_info.score_needed,
+            scan_mode: self
+                .scan_info
+                .mode
+                .clone()
+                .with_base_query(resolved_query.clone()),
         };
         let state = ScanState {
             source_idx,
@@ -614,7 +649,9 @@ impl PgSearchTableProvider {
         // rather than earlier because each process (leader and workers) independently
         // deserializes the logical plan in its own executor context. The
         // planstate and expr_context are injected by the execution codec.
-        let mut query = self.combine_query_with_filters(self.scan_info.query.clone(), filters);
+        let base_query = self.scan_info.mode.query().clone();
+        let needs_tokenizer = self.scan_info.mode.needs_tokenizer();
+        let mut query = self.combine_query_with_filters(base_query, filters);
         if query.has_postgres_expressions() || query.has_parameters() {
             let Some(planstate) = planstate else {
                 return Err(DataFusionError::Internal(
@@ -629,27 +666,16 @@ impl PgSearchTableProvider {
             query.init_postgres_expressions(planstate);
             query.solve_postgres_expressions(expr_context);
         }
-        // MVCC dispatch by `source_idx`:
+        // Replay the view the codec injected for this source, when there is one: the leader's
+        // reader then matches the manifest the DSM was populated from. Any other reader opens a
+        // plain snapshot.
         //
-        // Parallel worker or leader (`source_idx` Some):
-        // Retrieve the specific frozen segment IDs for this source from `ParallelScanState`.
-        //
-        // Serial (otherwise): Snapshot.
-
-        let mvcc_style = if let Some(parallel_state) = parallel_state {
-            unsafe {
-                if pg_sys::ParallelWorkerNumber == -1 {
-                    // Leader only sees snapshot-visible segments
-                    MvccSatisfies::Snapshot
-                } else {
-                    let ids = (*parallel_state).segment_ids_for_source(
-                        self.source_idx.expect("parallel_state implies source_idx"),
-                    );
-                    MvccSatisfies::ParallelWorker(ids)
-                }
-            }
-        } else {
-            MvccSatisfies::Snapshot
+        // Workers never reach this. An MPP worker decodes physical plans, and plans build
+        // address-free, so `parallel_state` is still null here and arrives on the physical scan
+        // later through `stamp_parallel_state`.
+        let mvcc_style = match self.segment_view.clone() {
+            Some(view) => MvccSatisfies::ParallelWorker(view),
+            None => MvccSatisfies::Snapshot,
         };
 
         let reader = SearchIndexReader::open_with_context(
@@ -659,7 +685,7 @@ impl PgSearchTableProvider {
             mvcc_style,
             expr_context.and_then(std::ptr::NonNull::new),
             None,
-            query.needs_tokenizer(),
+            query.needs_tokenizer() || needs_tokenizer,
         )
         .map_err(|e| DataFusionError::Internal(format!("Failed to open reader: {e}")))?;
 

@@ -27,9 +27,10 @@ use crate::api::operator::keyset::KeySet;
 use crate::api::version::Version;
 use crate::api::{FieldName, HashMap, OrderByFeature, OrderByInfo, SortDirection};
 use crate::index::fast_fields_helper::FFHelper;
-use crate::index::mvcc::MvccSatisfies;
+use crate::index::mvcc::{MVCCDirectory, MvccSatisfies, SegmentView};
 use crate::index::reader::io_stats;
 use crate::index::reader::scorer::{DeferredScorer, LazyWeight, ScorerIter};
+use crate::index::reader::sort_by_range::SortByRange;
 use crate::index::setup_tokenizers;
 use crate::postgres::heap::VisibilityChecker;
 use crate::postgres::options::{SortByDirection, SortByField};
@@ -39,7 +40,7 @@ use crate::postgres::storage::metadata::MetaPage;
 use crate::query::SearchQueryInput;
 use crate::query::estimate_tree::QueryWithEstimates;
 use crate::scan::info::RowEstimate;
-use crate::schema::SearchIndexSchema;
+use crate::schema::{SearchFieldType, SearchIndexSchema};
 
 use crate::index::reader::vector::VectorSearchWorker;
 use crate::postgres::customscan::basescan::vector_work::VectorClaim;
@@ -298,6 +299,10 @@ impl MultiSegmentSearchResults {
             lazy_estimated_rows: None,
         }
     }
+
+    pub fn searcher(&self) -> &Searcher {
+        &self.searcher
+    }
 }
 
 impl Iterator for MultiSegmentSearchResults {
@@ -355,6 +360,9 @@ pub struct SearchIndexReader {
     total_docs: u64,
     index_created_by_version: Option<Version>,
     segment_ordinal_by_id: HashMap<SegmentId, SegmentOrdinal>,
+    /// The directory `underlying_index` opened over; kept to capture this reader's
+    /// [`SegmentView`].
+    directory: MVCCDirectory,
 
     // [`PinnedBuffer`] has a Drop impl, so we hold onto it but don't otherwise use it
     //
@@ -367,6 +375,7 @@ pub struct SearchIndexReader {
 /// JoinScan initialization without requiring executor state.
 pub struct SearchIndexManifest {
     searcher: Searcher,
+    directory: MVCCDirectory,
     _cleanup_lock: Arc<PinnedBuffer>,
 }
 
@@ -384,6 +393,7 @@ impl Clone for SearchIndexReader {
             total_docs: self.total_docs,
             index_created_by_version: self.index_created_by_version,
             segment_ordinal_by_id: self.segment_ordinal_by_id.clone(),
+            directory: self.directory.clone(),
             _cleanup_lock: self._cleanup_lock.clone(),
         }
     }
@@ -391,6 +401,7 @@ impl Clone for SearchIndexReader {
 
 struct IndexComponents {
     cleanup_lock: Arc<PinnedBuffer>,
+    directory: MVCCDirectory,
     index: Index,
     reader: IndexReader,
     searcher: Searcher,
@@ -428,6 +439,7 @@ impl SearchIndexReader {
 
         Ok(IndexComponents {
             cleanup_lock,
+            directory,
             index,
             reader,
             searcher,
@@ -476,6 +488,7 @@ impl SearchIndexReader {
             Self::open_index_components(index_relation, mvcc_style, needs_tokenizer_manager)?;
         let IndexComponents {
             cleanup_lock,
+            directory,
             index,
             reader,
             searcher,
@@ -524,6 +537,7 @@ impl SearchIndexReader {
             total_docs,
             index_created_by_version,
             segment_ordinal_by_id: segment_ord_by_id,
+            directory,
             _cleanup_lock: cleanup_lock,
         })
     }
@@ -534,6 +548,19 @@ impl SearchIndexReader {
             .iter()
             .map(|r| r.segment_id())
             .collect()
+    }
+
+    /// This reader's segment view, for other readers to replay through
+    /// [`MvccSatisfies::ParallelWorker`].
+    pub fn segment_view(&self) -> SegmentView {
+        SegmentView::capture(self.searcher.segment_readers(), &self.directory)
+    }
+
+    /// A [`SegmentView`] over a SUBSET of this reader's segments — how a
+    /// vector scan registers its clustered and flat DSM sources
+    /// separately.
+    pub fn segment_view_of(&self, segment_readers: &[tantivy::SegmentReader]) -> SegmentView {
+        SegmentView::capture(segment_readers, &self.directory)
     }
 
     pub fn need_scores(&self) -> bool {
@@ -560,6 +587,15 @@ impl SearchIndexReader {
     pub fn and_query_input(&self, query: &SearchQueryInput) -> Self {
         let tantivy_query = self.make_query(query, None);
         self.and_query(tantivy_query)
+    }
+
+    /// Compiles a tantivy `Weight` for a tagged search query without scoring.
+    pub fn compile_match_weight(
+        &self,
+        query_input: &SearchQueryInput,
+    ) -> tantivy::Result<Box<dyn tantivy::query::Weight>> {
+        let tantivy_query = self.make_query(query_input, None);
+        tantivy_query.weight(EnableScoring::disabled_from_searcher(self.searcher()))
     }
 
     /// Count matched docs by summing `Weight::count` across segments.
@@ -943,6 +979,24 @@ impl SearchIndexReader {
                         ))
                         .into()
                     }};
+                }
+
+                // A range is indexed as a tantivy JSON object, so `value_type()` below reports
+                // `Type::Json`, which no arm handles — it would reach the catch-all `panic!`.
+                // Dispatch on the Postgres type instead: tantivy cannot distinguish a range's
+                // JSON from a user-supplied JSON column, and only the former is sortable (see
+                // `SearchField::is_sortable`). `SortByRange` compares the bound sub-columns the
+                // way Postgres' `range_cmp` does.
+                if matches!(field.field_type(), SearchFieldType::Range(_)) {
+                    return TopKSearchResults::new_for_discarded_field(self.top_in_segments(
+                        segment_ids,
+                        (SortByRange::for_field(sort_field), order),
+                        erased_features,
+                        n,
+                        offset,
+                        aux_collector,
+                    ))
+                    .into();
                 }
 
                 match field.field_entry().field_type().value_type() {
@@ -1606,7 +1660,8 @@ impl SearchIndexReader {
                     direction,
                 } => {
                     // NOTE: The list of supported field types for `SortByErasedType` must be synced with
-                    // `SearchField::is_sortable`.
+                    // `SearchField::is_sortable`, except Range: `is_sortable` accepts it, but only as
+                    // the leading key, which `sortable_at_position` enforces before we get here.
                     erased_features
                         .push_feature(SortByErasedType::for_field(sort_field), *direction);
                 }
@@ -1693,12 +1748,15 @@ impl SearchIndexManifest {
             SearchIndexReader::open_index_components(index_relation, mvcc_style, false)?;
         Ok(Self {
             searcher: components.searcher,
+            directory: components.directory,
             _cleanup_lock: components.cleanup_lock,
         })
     }
 
-    pub fn segment_readers(&self) -> &[SegmentReader] {
-        self.searcher.segment_readers()
+    /// This manifest's segment view, for other readers to replay through
+    /// [`MvccSatisfies::ParallelWorker`].
+    pub fn segment_view(&self) -> SegmentView {
+        SegmentView::capture(self.searcher.segment_readers(), &self.directory)
     }
 }
 

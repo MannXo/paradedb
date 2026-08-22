@@ -58,15 +58,15 @@ use crate::postgres::customscan::aggregatescan::datafusion_exec::create_aggregat
 use crate::postgres::customscan::joinscan::scan_state::{
     SessionContextProfile, create_datafusion_session_context,
 };
-use crate::postgres::customscan::mpp::dispatch::{
-    dispatch_payload_from_stages, dispatch_plan_capacity,
-};
+use crate::postgres::customscan::mpp::dispatch::dispatch_payload_from_stages;
 use crate::postgres::customscan::mpp::exec_worker::{MppWorkerInputs, run_mpp_worker};
 use crate::postgres::customscan::mpp::glue::{
     MIN_TOTAL_WORKER_COUNT, MppLeaderState, estimate_dsm_size, leader_setup, producer_worker_cap,
     worker_setup,
 };
-use crate::postgres::customscan::mpp::worker_fragments::{collect_stages, max_producer_task_count};
+use crate::postgres::customscan::mpp::worker_fragments::{
+    collect_stages, max_producer_task_count, stages_have_data_parallelism,
+};
 use crate::postgres::{ParallelScanArgs, ParallelScanState};
 
 /// `state_values()` order. Each index maps to a `ParallelState` TOC entry the workers look up.
@@ -238,24 +238,23 @@ pub enum MppLifecycle {
     /// teardown already reclaimed the leader state.
     #[default]
     Inactive,
-    /// Serialized logical-plan bytes retained while an MPP launch is pending. AggregateScan uses
-    /// their length for DSM sizing; JoinScan treats only the variant as the pending marker and
-    /// sizes DSM from its freshly rebound execute-time plan.
-    PlanBytes(Vec<u8>),
+    /// The scan qualified for one MPP planning and launch attempt. No plan is stored here: the
+    /// finished physical stages produce the exact dispatch payload before DSM allocation.
+    Pending,
     /// The workers are running dispatched fragments; carries the leader's mesh and finish
     /// handles until teardown.
     Launched(MppLeaderState),
 }
 
 impl MppLifecycle {
-    /// Consume the stashed plan bytes. Leaves `Inactive`, so a launch fallback reads as the
+    /// Consume the pending launch marker. Leaves `Inactive`, so a launch fallback reads as the
     /// serial path from then on.
-    pub fn take_plan_bytes(&mut self) -> Option<Vec<u8>> {
+    pub fn take_pending(&mut self) -> bool {
         match std::mem::take(self) {
-            MppLifecycle::PlanBytes(bytes) => Some(bytes),
+            MppLifecycle::Pending => true,
             other => {
                 *self = other;
-                None
+                false
             }
         }
     }
@@ -299,7 +298,6 @@ impl MppLifecycle {
 /// where a silent serial fallback would hide a real bug.
 fn launch_mpp(
     physical: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-    plan_bytes_len: usize,
     args: ParallelScanArgs,
     worker_entrypoint: &'static str,
 ) -> Option<MppLeaderState> {
@@ -309,28 +307,36 @@ fn launch_mpp(
 
     // Task counts were capped by `target_partitions = cap` at plan time and reflect segment
     // counts (#5657). The producer floor keeps the mesh-width invariant; see
-    // [`MIN_TOTAL_WORKER_COUNT`].
-    let max_tasks = max_producer_task_count(&stages);
-    if max_tasks < 2 {
+    // [`MIN_TOTAL_WORKER_COUNT`]. Same gate as plain EXPLAIN (#5784).
+    if !stages_have_data_parallelism(&stages) {
         // 0: nothing to distribute. 1: no data parallelism — every 1-task stage lands on
         // proc 1 (`proc_for_task`), leaving the second (floor) producer idle. Run serially.
         // This also keeps `producer_count <= max_tasks`, so every launched proc owns at
         // least one fragment of the widest stage.
         return None;
     }
+    let max_tasks = max_producer_task_count(&stages);
     let cap = producer_worker_cap();
     let producer_count = (max_tasks as u32).clamp(MIN_TOTAL_WORKER_COUNT - 1, cap);
 
+    // The finished physical stages contain all routing metadata, so build the real payload before
+    // sizing DSM. A failure is a codec bug, and no workers have been started at this point.
+    let t_payload = std::time::Instant::now();
+    let payload = match dispatch_payload_from_stages(&stages) {
+        Ok(p) => p,
+        Err(e) => pgrx::error!("mpp: dispatch payload build failed: {e}"),
+    };
+    timing.payload_us = t_payload.elapsed().as_micros() as u64;
+
     let t_prepare = std::time::Instant::now();
-    let payload_capacity = dispatch_plan_capacity(plan_bytes_len);
-    let region_bytes = match estimate_dsm_size(producer_count + 1, payload_capacity) {
+    let region_bytes = match estimate_dsm_size(producer_count + 1, payload.len()) {
         Ok(sz) => sz,
         Err(e) => {
             pgrx::warning!("mpp: estimate_dsm failed: {e}; running serially");
             return None;
         }
     };
-    let scan_size = ParallelScanState::size_of(&args.all_nsegments(), &[], false);
+    let scan_size = ParallelScanState::size_of(&args.all_nsegments(), &[], false, false);
 
     let process = MppParallelProcess {
         // SAFETY: workers can only read the region back as `u8`, and they hold on the go
@@ -351,8 +357,7 @@ fn launch_mpp(
         MPP_MQ_SIZE,
     )?;
 
-    // Populate the ParallelScanState in place while the DSM is mapped and the leader still holds
-    // the source manifests `args` borrows.
+    // Populate the ParallelScanState in place while the DSM is mapped.
     let scan_ptr = match launcher.state_manager().slice_mut::<u8>(SCAN_IDX) {
         Ok(Some(s)) => s.as_mut_ptr() as *mut ParallelScanState,
         _ => pgrx::error!("mpp: parallel scan state region missing"),
@@ -366,17 +371,6 @@ fn launch_mpp(
     // launch was attempted at all (mpp_worker_sizing).
     crate::mpp_log!("launch: spawning {producer_count} producers");
     let attach = launcher.launch()?;
-
-    // Derive the per-stage subplans from the plan the leader itself will execute. Built before
-    // `wait_for_attach` so serialization overlaps worker attachment (#5756). A failure here is
-    // a hard error: a serialization gap is a codec bug, and the parked workers die with the
-    // transaction.
-    let t_payload = std::time::Instant::now();
-    let payload = match dispatch_payload_from_stages(&stages, payload_capacity) {
-        Ok(p) => p,
-        Err(e) => pgrx::error!("mpp: dispatch payload build failed: {e}"),
-    };
-    timing.payload_us = t_payload.elapsed().as_micros() as u64;
 
     let t_attach = std::time::Instant::now();
     let finish = attach.wait_for_attach()?;
@@ -451,26 +445,34 @@ fn launch_mpp(
 /// AggregateScan launch entry: aggregate worker symbol.
 pub fn launch_mpp_aggregate(
     physical: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-    plan_bytes_len: usize,
     args: ParallelScanArgs,
 ) -> Option<MppLeaderState> {
-    launch_mpp(physical, plan_bytes_len, args, "mpp_launched_worker_agg")
+    launch_mpp(physical, args, "mpp_launched_worker_agg")
 }
 
 /// JoinScan launch entry: join worker symbol.
 pub fn launch_mpp_join(
     physical: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-    plan_bytes_len: usize,
     args: ParallelScanArgs,
 ) -> Option<MppLeaderState> {
-    launch_mpp(physical, plan_bytes_len, args, "mpp_launched_worker_join")
+    launch_mpp(physical, args, "mpp_launched_worker_join")
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use super::*;
+    use pgrx::pg_test;
 
-    #[test]
+    #[pg_test]
+    fn pending_launch_is_consumed_once() {
+        let mut lifecycle = MppLifecycle::Pending;
+
+        assert!(lifecycle.take_pending());
+        assert!(!lifecycle.take_pending());
+    }
+
+    #[pg_test]
     fn short_launch_uses_the_attached_width_when_the_mesh_is_viable() {
         assert_eq!(
             mpp_attach_outcome(5, 0),

@@ -40,9 +40,8 @@ use datafusion_distributed::{
 };
 use futures::{FutureExt, StreamExt};
 use pgrx::pg_sys;
-use tantivy::index::SegmentId;
 
-use crate::api::HashSet;
+use crate::index::mvcc::SegmentView;
 use crate::postgres::customscan::datafusion::memory::{build_runtime_env, create_memory_pool};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_distributed::PartitionSink;
@@ -100,8 +99,11 @@ pub(crate) fn build_mpp_session_context(
     // for stage sizing and target_partitions, so it plans against the cap
     // (`producer_worker_cap()`, from PG's parallelism GUCs). EXPLAIN never opens a
     // `WorkerConnection`, so we skip the transport install and the fork's default sits
-    // unused. mesh = Some reads the launched width from the mesh header, which the plan-first
-    // launch sized from the plan's task counts (#5667).
+    // unused. Callers that render plain EXPLAIN must still apply the launch gate
+    // (`mpp_plan_has_data_parallelism`) and replan serially when the finished plan has
+    // fewer than 2 producer tasks (#5784), matching execution. mesh = Some reads the
+    // launched width from the mesh header, which the plan-first launch sized from the
+    // plan's task counts (#5667).
     let n_workers = match mesh.as_ref() {
         Some(m) => m.n_workers() as usize,
         None => producer_worker_cap() as usize,
@@ -292,14 +294,14 @@ pub(crate) fn run_mpp_worker(
     let plan_bytes = &worker_session.plan_bytes;
     let this_proc = worker_mesh.this_proc;
 
-    // Build per-source canonical segment ID sets from the populated ParallelScanState.
+    // Build per-source segment views from the populated ParallelScanState.
     // Workers will then claim individual segments via `checkout_segment_for_source` inside their
     // `PgSearchTableProvider`.
-    let mut index_segment_ids: Vec<HashSet<SegmentId>> =
-        vec![HashSet::default(); plan_sources_count];
+    let mut index_segment_views: Vec<SegmentView> =
+        vec![SegmentView::default(); plan_sources_count];
     if let Some(ps) = parallel_state {
-        for (i, slot) in index_segment_ids.iter_mut().enumerate() {
-            *slot = unsafe { (*ps).segment_ids_for_source_unlocked(i) };
+        for (i, slot) in index_segment_views.iter_mut().enumerate() {
+            *slot = unsafe { (*ps).segment_view_for_source_unlocked(i) };
         }
     }
 
@@ -368,7 +370,7 @@ pub(crate) fn run_mpp_worker(
             &set_plan.plan_proto,
             &decode_ctx,
             parallel_state,
-            index_segment_ids.to_vec(),
+            index_segment_views.to_vec(),
             Some(expr_context_guard.as_ptr()),
             &DeduplicatingProtoConverter {},
         ) {
@@ -423,20 +425,6 @@ pub(crate) fn run_mpp_worker(
                         proc_for_task(n_workers, task)
                     }
                 };
-                let base = match worker_session
-                    .outbound_senders()
-                    .get(dest_proc as usize)
-                    .and_then(|s| s.as_ref())
-                {
-                    Some(s) => s,
-                    None => {
-                        return Err(datafusion::common::DataFusionError::Internal(format!(
-                            "mpp worker dispatch: outbound_senders[{dest_proc}] is None \
-                             (self-loop or unattached); fragment stage_id={} task_idx={}",
-                            fragment.stage_id, fragment.task_idx,
-                        )));
-                    }
-                };
                 let q_u32 = u32::try_from(q).map_err(|_| {
                     datafusion::common::DataFusionError::Internal(format!(
                         "mpp worker dispatch: output partition {q} exceeds transport u32 \
@@ -444,25 +432,44 @@ pub(crate) fn run_mpp_worker(
                         fragment.stage_id, fragment.task_idx,
                     ))
                 })?;
+                let stream_key = MppDataStreamKey::new(fragment.stage_id, fragment.task_idx, q_u32);
                 crate::mpp_log!(
                     "mpp worker dispatch this_proc={this_proc} fragment(stage_id={}, \
                      task_idx={}) partition={q} → dest_proc={dest_proc}",
                     fragment.stage_id,
                     fragment.task_idx,
                 );
-                // Attach the worker mesh as the cooperative drain so a full outbound
-                // ring doesn't block the backend thread. The spin pulls every inbound
-                // drain while retrying the send, breaking the symmetric-send stall
-                // pattern where every peer is blocked sending to a full peer.
-                per_partition_sinks.push(Box::new(MppPartitionSink::new(
-                    base.clone_with_header(MppFrameHeader::batch(
-                        MppDataStreamKey::new(fragment.stage_id, fragment.task_idx, q_u32),
-                        mesh_for_block.this_proc,
-                    ))
-                    .with_cooperative_drain(
-                        Arc::clone(&mesh_for_block) as Arc<dyn CooperativeDrainSet>
-                    ),
-                )));
+                if dest_proc == mesh_for_block.this_proc {
+                    per_partition_sinks.push(mesh_for_block.open_local_partition_sink(stream_key));
+                } else {
+                    let base = match worker_session
+                        .outbound_senders()
+                        .get(dest_proc as usize)
+                        .and_then(|s| s.as_ref())
+                    {
+                        Some(s) => s,
+                        None => {
+                            return Err(datafusion::common::DataFusionError::Internal(format!(
+                                "mpp worker dispatch: outbound_senders[{dest_proc}] is None \
+                                 (unattached); fragment stage_id={} task_idx={}",
+                                fragment.stage_id, fragment.task_idx,
+                            )));
+                        }
+                    };
+                    // Attach the worker mesh as the cooperative drain so a full outbound
+                    // ring doesn't block the backend thread. The spin pulls every inbound
+                    // drain while retrying the send, breaking the symmetric-send stall
+                    // pattern where every peer is blocked sending to a full peer.
+                    per_partition_sinks.push(Box::new(MppPartitionSink::new(
+                        base.clone_with_header(MppFrameHeader::batch(
+                            stream_key,
+                            mesh_for_block.this_proc,
+                        ))
+                        .with_cooperative_drain(
+                            Arc::clone(&mesh_for_block) as Arc<dyn CooperativeDrainSet>
+                        ),
+                    )));
+                }
             }
 
             // Build a TaskContext seeded with the right `DistributedTaskContext` so the boundary

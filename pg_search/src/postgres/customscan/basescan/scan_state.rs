@@ -208,7 +208,7 @@ impl BaseScanState {
         serde_json::to_value(&self.base_search_query_input)
     }
 
-    pub fn parallel_scan_args(&mut self) -> ParallelScanArgs<'_> {
+    pub fn parallel_scan_args(&mut self) -> ParallelScanArgs {
         let query = serde_json::to_vec(self.search_query_input())
             .expect("should be able to serialize query");
 
@@ -232,14 +232,19 @@ impl BaseScanState {
             .as_ref()
             .expect("search reader must be initialized to build parallel serialization data");
         let all_sources = match &self.vector_work {
-            Some(work) => work.sources(),
-            None => vec![search_reader.segment_readers()],
+            Some(work) => work
+                .sources()
+                .into_iter()
+                .map(|source| search_reader.segment_view_of(source))
+                .collect(),
+            None => vec![search_reader.segment_view()],
         };
 
         ParallelScanArgs {
             all_sources,
             query,
             with_aggregates,
+            with_segment_info: true,
         }
     }
 
