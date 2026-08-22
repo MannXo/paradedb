@@ -41,6 +41,7 @@ use crate::query::estimate_tree::QueryWithEstimates;
 use crate::scan::info::RowEstimate;
 use crate::schema::SearchIndexSchema;
 
+use crate::index::reader::vector::VectorSearchWorker;
 use crate::postgres::customscan::basescan::vector_work::VectorClaim;
 use anyhow::Result;
 use tantivy::aggregation::DistributedAggregationCollector;
@@ -53,8 +54,8 @@ use tantivy::collector::{Collector, SegmentCollector, SortKeyComputer, TopDocs};
 use tantivy::index::{Index, Order, SegmentId};
 use tantivy::query::{EnableScoring, QueryClone, QueryParser, Weight};
 use tantivy::snippet::SnippetGenerator;
+use tantivy::vector::ProbeStats;
 use tantivy::vector::ivf::AdaptiveProbeParams;
-use tantivy::vector::{ProbeStats, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 use tantivy::{
     DateTime, DocAddress, DocId, DocSet, Executor, IndexReader, ReloadPolicy, Score, Searcher,
     SegmentOrdinal, SegmentReader, TantivyDocument, query::Query, schema::OwnedValue,
@@ -152,61 +153,6 @@ impl From<TopKSearchResults> for TopKSearch {
 }
 
 /// The global probe loop's instrumentation, as the EXPLAIN-facing JSON.
-/// Drives one participant's vector search through the collector's
-/// explicit API. Units are pulled from `claims` ONE AT A TIME, and each
-/// maps 1:1 onto a call — the clustered chunk to `collect_ivf`, a flat
-/// segment to `collect_flat` — so the next unit is claimed only after
-/// the previous one's work is done: while one participant is inside the
-/// chunk, the others drain the flat units. `merge` folds the fruits.
-/// Without a claim source (serial), the collector's own
-/// partition-everything `search` runs.
-struct RunVectorSearch<'a> {
-    searcher: &'a tantivy::Searcher,
-    query: &'a dyn tantivy::query::Query,
-}
-
-impl RunVectorSearch<'_> {
-    fn run<T, S>(
-        &self,
-        collector: TopDocsByVectorSimilarity<T, S>,
-        claims: Option<&mut (dyn FnMut() -> Option<VectorClaim> + '_)>,
-    ) -> VectorSimilarityFruit
-    where
-        T: tantivy::vector::VectorElement,
-        S: tantivy::collector::SortKeyComputer + Send + Sync + 'static,
-    {
-        let Some(claims) = claims else {
-            return collector
-                .search(self.searcher, self.query)
-                .expect("search should not fail");
-        };
-        let readers = self.searcher.segment_readers();
-        let ordinal_of = |id: SegmentId| {
-            readers
-                .iter()
-                .position(|reader| reader.segment_id() == id)
-                .map(|ordinal| ordinal as tantivy::SegmentOrdinal)
-                .expect("claimed segment must exist in the searcher's snapshot")
-        };
-        let mut fruits = Vec::new();
-        while let Some(claim) = claims() {
-            fruits.push(match claim {
-                VectorClaim::Clustered(ids) => {
-                    let ordinals: Vec<tantivy::SegmentOrdinal> =
-                        ids.iter().copied().map(ordinal_of).collect();
-                    collector
-                        .collect_ivf(self.searcher, self.query, &ordinals)
-                        .expect("search should not fail")
-                }
-                VectorClaim::Flat(id) => collector
-                    .collect_flat(self.searcher, self.query, ordinal_of(id))
-                    .expect("search should not fail"),
-            });
-        }
-        collector.merge(fruits)
-    }
-}
-
 fn probe_stats_to_json(stats: &ProbeStats) -> serde_json::Value {
     serde_json::to_value(stats).expect("ProbeStats should serialize to JSON")
 }
@@ -1150,10 +1096,7 @@ impl SearchIndexReader {
                 let tie_break_count = tie_breaks.len();
                 let mut tie_breaks = tie_breaks.into_iter();
                 let mut next = || tie_breaks.next().expect("tie-break feature should exist");
-                let run = RunVectorSearch {
-                    searcher: &self.searcher,
-                    query: &self.query,
-                };
+                let run = VectorSearchWorker::new(&self.searcher, &self.query);
                 let claims = vector_claims;
                 let fruit = match tie_break_count {
                     0 => run.run(collector, claims),
