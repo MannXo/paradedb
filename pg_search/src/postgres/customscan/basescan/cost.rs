@@ -327,15 +327,10 @@ fn cost_test_limited(
 /// Inputs to [`decide_scan_parallelism`].
 pub(super) struct ScanParallelismInputs<'a> {
     pub(super) prunability: TopKPrunability,
-    /// `true` when the exec method's primary ORDER BY is a vector
-    /// distance (see [`WorkerDecisionReason::GlobalVectorSearch`]).
-    pub(super) is_vector_orderby: bool,
-    /// The participants a parallel vector scan wants — one per flat
-    /// segment plus one for the clustered chunk (see
-    /// [`super::vector_work::VectorScanWork::desired_participants`]).
-    /// `None` (no flat tier in the plan-time snapshot) keeps the vector
-    /// scan serial.
-    pub(super) vector_participants: Option<usize>,
+    /// The scan's vector parallelism (see
+    /// [`super::vector_work::VectorScanParallelism`] and
+    /// [`WorkerDecisionReason::GlobalVectorSearch`]).
+    pub(super) vector: super::vector_work::VectorScanParallelism,
     pub(super) query: &'a SearchQueryInput,
     /// The costable drive cost (see [`costable_drive_cost`]); `Some` marks the scan as costable and
     /// feeds both [`cost_test_limited`] and [`estimate_path_cost`].
@@ -365,8 +360,7 @@ pub(super) struct ScanParallelismInputs<'a> {
 pub(super) unsafe fn decide_scan_parallelism(inputs: ScanParallelismInputs) -> WorkerPathPolicy {
     let ScanParallelismInputs {
         prunability,
-        is_vector_orderby,
-        vector_participants,
+        vector,
         query,
         drive_cost,
         row_estimate,
@@ -395,8 +389,11 @@ pub(super) unsafe fn decide_scan_parallelism(inputs: ScanParallelismInputs) -> W
     //    cost model cannot price the split (both paths cost the same to
     //    it), so this is a hard gate on the flat tier existing, not a
     //    costed choice.
-    if is_vector_orderby {
-        if let (true, Some(participants)) = (consider_parallel, vector_participants) {
+    match vector {
+        super::vector_work::VectorScanParallelism::NotVector => {}
+        super::vector_work::VectorScanParallelism::Parallel { participants }
+            if consider_parallel =>
+        {
             let nworkers = participants
                 .saturating_sub(usize::from(parallel_leader_participates))
                 .max(1);
@@ -405,9 +402,11 @@ pub(super) unsafe fn decide_scan_parallelism(inputs: ScanParallelismInputs) -> W
                 reason: WorkerDecisionReason::GlobalVectorSearch,
             };
         }
-        return WorkerPathPolicy::SerialOnly {
-            reason: WorkerDecisionReason::GlobalVectorSearch,
-        };
+        _ => {
+            return WorkerPathPolicy::SerialOnly {
+                reason: WorkerDecisionReason::GlobalVectorSearch,
+            };
+        }
     }
 
     // 1. Prunable short-circuit -> serial only. Block-WAND keeps primarily score-DESC ordered top-k sublinear

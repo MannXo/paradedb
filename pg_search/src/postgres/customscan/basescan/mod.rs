@@ -969,29 +969,12 @@ impl CustomScan for BaseScan {
                 let is_sorted = method.declares_sorted_output();
                 let consider_parallel_local = (*builder.args().rel).consider_parallel;
                 let prunability = topk_can_prune_for_method(&method, builder.args().root, &quals);
-                let is_vector_orderby = matches!(
-                    &method,
-                    ExecMethodType::TopK {
-                        orderby_info: Some(infos),
-                        ..
-                    } if infos
-                        .first()
-                        .is_some_and(|info| info.is_vector_distance())
-                );
-                let vector_participants =
-                    if is_vector_orderby && bm25_index.options().mutable_segment_rows().is_some() {
-                        vector_work::VectorScanWork::for_index(&bm25_index, &method)
-                            .filter(vector_work::VectorScanWork::has_flat)
-                            .map(|work| work.desired_participants())
-                    } else {
-                        None
-                    };
+                let vector = vector_work::VectorScanParallelism::for_scan(&bm25_index, &method);
 
                 // Decide the policy first: its reason gates the path cost below.
                 let policy = decide_scan_parallelism(ScanParallelismInputs {
                     prunability,
-                    is_vector_orderby,
-                    vector_participants,
+                    vector,
                     query: &query,
                     drive_cost,
                     row_estimate,

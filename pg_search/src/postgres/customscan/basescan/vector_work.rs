@@ -22,6 +22,48 @@ const CLUSTERED_SOURCE: usize = 0;
 /// DSM source index of the flat segments (one unit each).
 const FLAT_SOURCE: usize = 1;
 
+/// The planner's three-state view of a scan's vector parallelism —
+/// replaces carrying `is_vector_orderby` and a participant count
+/// separately.
+pub enum VectorScanParallelism {
+    /// Not a vector-distance ORDER BY scan.
+    NotVector,
+    /// Vector scan with no flat tier to hand a worker: serial only.
+    Serial,
+    /// Vector scan with a flat tier: force one participant per unit of
+    /// work (each flat segment, plus the clustered chunk).
+    Parallel { participants: usize },
+}
+
+impl VectorScanParallelism {
+    /// Decide from the plan-time snapshot. Opens the index only when the
+    /// scan is a vector ORDER BY on an index that uses mutable segments —
+    /// the only shape that can have a flat tier.
+    pub fn for_scan(indexrel: &PgSearchRelation, method: &ExecMethodType) -> Self {
+        let is_vector_orderby = matches!(
+            method,
+            ExecMethodType::TopK {
+                orderby_info: Some(infos),
+                ..
+            } if infos.first().is_some_and(|info| info.is_vector_distance())
+        );
+        if !is_vector_orderby {
+            return VectorScanParallelism::NotVector;
+        }
+        let flat_work = indexrel
+            .options()
+            .mutable_segment_rows()
+            .and_then(|_| VectorScanWork::for_index(indexrel, method))
+            .filter(VectorScanWork::has_flat);
+        match flat_work {
+            Some(work) => VectorScanParallelism::Parallel {
+                participants: work.desired_participants(),
+            },
+            None => VectorScanParallelism::Serial,
+        }
+    }
+}
+
 /// A vector scan's snapshot partitioned by tier.
 pub struct VectorScanWork {
     clustered: Vec<SegmentReader>,
