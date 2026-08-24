@@ -252,7 +252,7 @@ impl BitmapPlanner {
                 for ri in PgList::<pg_sys::RestrictInfo>::from_pg((*ioi).indrestrictinfo).iter_ptr()
                 {
                     if self.matches_heap_expr((*ri).clause.cast())
-                        && let Some(iclause) = match_clause_to_index(ri, ioi)
+                        && let Some(iclause) = match_clause_to_index(self.root, ri, ioi)
                     {
                         iclauses.push(iclause);
                     }
@@ -448,49 +448,223 @@ impl BitmapExec {
     }
 }
 
-/// Mirror of the direct-match arm of core's `match_opclause_to_indexcol` (which is
-/// `static` in indxpath.c and unreachable from extensions): accepts `indexkey OP
-/// pseudoconstant` with the operator in the key column's opfamily. Clauses needing
-/// support-function derivation (LIKE prefix, PostGIS ST_DWithin) are not yet matched.
+/// Mirror of core's `match_opclause_to_indexcol` / `match_funcclause_to_indexcol`
+/// (both `static` in indxpath.c and unreachable from extensions): direct
+/// `indexkey OP pseudoconstant` matches, their commuted forms, and derivation through
+/// the operator's or function's planner support function -- the route core's `LIKE`
+/// and PostGIS's `ST_DWithin` use to produce (lossy) index quals.
 unsafe fn match_clause_to_index(
+    root: *mut pg_sys::PlannerInfo,
     ri: *mut pg_sys::RestrictInfo,
     ioi: *mut pg_sys::IndexOptInfo,
 ) -> Option<*mut pg_sys::IndexClause> {
     unsafe {
-        let clause = (*ri).clause.cast::<pg_sys::Node>();
-        if (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
-            return None;
+        match (*(*ri).clause.cast::<pg_sys::Node>()).type_ {
+            pg_sys::NodeTag::T_OpExpr => match_opclause(root, ri, ioi),
+            pg_sys::NodeTag::T_FuncExpr => match_funcclause(root, ri, ioi),
+            _ => None,
         }
-        let opexpr = clause.cast::<pg_sys::OpExpr>();
+    }
+}
+
+unsafe fn match_opclause(
+    root: *mut pg_sys::PlannerInfo,
+    ri: *mut pg_sys::RestrictInfo,
+    ioi: *mut pg_sys::IndexOptInfo,
+) -> Option<*mut pg_sys::IndexClause> {
+    unsafe {
+        let opexpr = (*ri).clause.cast::<pg_sys::OpExpr>();
         let args = PgList::<pg_sys::Node>::from_pg((*opexpr).args);
         if args.len() != 2 {
             return None;
         }
-        let (mut leftop, rightop) = (args.get_ptr(0)?, args.get_ptr(1)?);
-        if (*leftop).type_ == pg_sys::NodeTag::T_RelabelType {
-            leftop = (*leftop.cast::<pg_sys::RelabelType>()).arg.cast();
-        }
-        if pg_sys::contain_var_clause(rightop) || pg_sys::contain_volatile_functions(rightop) {
-            return None;
-        }
+        let (leftop, rightop) = (
+            strip_relabel(args.get_ptr(0)?),
+            strip_relabel(args.get_ptr(1)?),
+        );
 
         for indexcol in 0..(*ioi).nkeycolumns {
-            if pg_sys::match_index_to_operand(leftop, indexcol, ioi)
-                && pg_sys::op_in_opfamily((*opexpr).opno, *(*ioi).opfamily.add(indexcol as usize))
-            {
-                let iclause: *mut pg_sys::IndexClause =
-                    pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexClause>()).cast();
-                (*iclause).type_ = pg_sys::NodeTag::T_IndexClause;
-                (*iclause).rinfo = ri;
-                let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
-                indexquals.push(ri);
-                (*iclause).indexquals = indexquals.into_pg();
-                (*iclause).lossy = false;
-                (*iclause).indexcol = indexcol as _;
-                (*iclause).indexcols = std::ptr::null_mut();
-                return Some(iclause);
+            let opfamily = *(*ioi).opfamily.add(indexcol as usize);
+
+            if pg_sys::match_index_to_operand(leftop, indexcol, ioi) && is_pseudoconstant(rightop) {
+                if pg_sys::op_in_opfamily((*opexpr).opno, opfamily) {
+                    let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
+                    indexquals.push(ri);
+                    return Some(build_index_clause(ri, indexquals, false, indexcol));
+                }
+                if let Some(iclause) =
+                    derive_via_support(root, ri, (*opexpr).opfuncid, 0, indexcol, ioi)
+                {
+                    return Some(iclause);
+                }
+            }
+
+            if pg_sys::match_index_to_operand(rightop, indexcol, ioi) && is_pseudoconstant(leftop) {
+                let comm_op = pg_sys::get_commutator((*opexpr).opno);
+                if comm_op != pg_sys::InvalidOid && pg_sys::op_in_opfamily(comm_op, opfamily) {
+                    let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
+                    indexquals.push(pg_sys::commute_restrictinfo(ri, comm_op));
+                    return Some(build_index_clause(ri, indexquals, false, indexcol));
+                }
+                if let Some(iclause) =
+                    derive_via_support(root, ri, (*opexpr).opfuncid, 1, indexcol, ioi)
+                {
+                    return Some(iclause);
+                }
             }
         }
         None
+    }
+}
+
+unsafe fn match_funcclause(
+    root: *mut pg_sys::PlannerInfo,
+    ri: *mut pg_sys::RestrictInfo,
+    ioi: *mut pg_sys::IndexOptInfo,
+) -> Option<*mut pg_sys::IndexClause> {
+    unsafe {
+        let funcexpr = (*ri).clause.cast::<pg_sys::FuncExpr>();
+        let args = PgList::<pg_sys::Node>::from_pg((*funcexpr).args);
+        for indexcol in 0..(*ioi).nkeycolumns {
+            for (indexarg, arg) in args.iter_ptr().enumerate() {
+                if pg_sys::match_index_to_operand(strip_relabel(arg), indexcol, ioi)
+                    && let Some(iclause) = derive_via_support(
+                        root,
+                        ri,
+                        (*funcexpr).funcid,
+                        indexarg as i32,
+                        indexcol,
+                        ioi,
+                    )
+                {
+                    return Some(iclause);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Ask the clause function's planner support function to derive indexable quals
+/// (`SupportRequestIndexCondition`), exactly as core's
+/// `get_index_clause_from_support` does. The support function decides whether the
+/// derivation is possible and whether it is lossy.
+unsafe fn derive_via_support(
+    root: *mut pg_sys::PlannerInfo,
+    ri: *mut pg_sys::RestrictInfo,
+    funcid: pg_sys::Oid,
+    indexarg: i32,
+    indexcol: i32,
+    ioi: *mut pg_sys::IndexOptInfo,
+) -> Option<*mut pg_sys::IndexClause> {
+    unsafe {
+        let prosupport = pg_sys::get_func_support(funcid);
+        if prosupport == pg_sys::InvalidOid {
+            return None;
+        }
+
+        let mut req = pg_sys::SupportRequestIndexCondition::default();
+        req.type_ = pg_sys::NodeTag::T_SupportRequestIndexCondition;
+        req.root = root;
+        req.funcid = funcid;
+        req.node = (*ri).clause.cast();
+        req.indexarg = indexarg;
+        req.index = ioi;
+        req.indexcol = indexcol;
+        req.opfamily = *(*ioi).opfamily.add(indexcol as usize);
+        req.indexcollation = *(*ioi).indexcollations.add(indexcol as usize);
+        req.lossy = true;
+
+        let result = pg_sys::OidFunctionCall1Coll(
+            prosupport,
+            pg_sys::InvalidOid,
+            pg_sys::Datum::from(std::ptr::addr_of_mut!(req) as usize),
+        );
+        let derived: *mut pg_sys::List = result.cast_mut_ptr();
+        if derived.is_null() {
+            return None;
+        }
+
+        let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
+        for expr in PgList::<pg_sys::Node>::from_pg(derived).iter_ptr() {
+            indexquals.push(make_simple_restrictinfo(root, expr.cast()));
+        }
+        if indexquals.is_empty() {
+            return None;
+        }
+        Some(build_index_clause(ri, indexquals, req.lossy, indexcol))
+    }
+}
+
+unsafe fn build_index_clause(
+    ri: *mut pg_sys::RestrictInfo,
+    indexquals: PgList<pg_sys::RestrictInfo>,
+    lossy: bool,
+    indexcol: i32,
+) -> *mut pg_sys::IndexClause {
+    unsafe {
+        let iclause: *mut pg_sys::IndexClause =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexClause>()).cast();
+        (*iclause).type_ = pg_sys::NodeTag::T_IndexClause;
+        (*iclause).rinfo = ri;
+        (*iclause).indexquals = indexquals.into_pg();
+        (*iclause).lossy = lossy;
+        (*iclause).indexcol = indexcol as _;
+        (*iclause).indexcols = std::ptr::null_mut();
+        iclause
+    }
+}
+
+unsafe fn strip_relabel(mut node: *mut pg_sys::Node) -> *mut pg_sys::Node {
+    unsafe {
+        while (*node).type_ == pg_sys::NodeTag::T_RelabelType {
+            node = (*node.cast::<pg_sys::RelabelType>()).arg.cast();
+        }
+        node
+    }
+}
+
+unsafe fn is_pseudoconstant(node: *mut pg_sys::Node) -> bool {
+    unsafe { !pg_sys::contain_var_clause(node) && !pg_sys::contain_volatile_functions(node) }
+}
+
+#[cfg(feature = "pg15")]
+unsafe fn make_simple_restrictinfo(
+    root: *mut pg_sys::PlannerInfo,
+    clause: *mut pg_sys::Expr,
+) -> *mut pg_sys::RestrictInfo {
+    unsafe {
+        pg_sys::make_restrictinfo(
+            root,
+            clause,
+            true,
+            false,
+            false,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+#[cfg(not(feature = "pg15"))]
+unsafe fn make_simple_restrictinfo(
+    root: *mut pg_sys::PlannerInfo,
+    clause: *mut pg_sys::Expr,
+) -> *mut pg_sys::RestrictInfo {
+    unsafe {
+        pg_sys::make_restrictinfo(
+            root,
+            clause,
+            true,
+            false,
+            false,
+            false,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
     }
 }
