@@ -194,7 +194,7 @@ impl BitmapPlanner {
                 for ri in PgList::<pg_sys::RestrictInfo>::from_pg((*ioi).indrestrictinfo).iter_ptr()
                 {
                     if self.matches_heap_expr((*ri).clause.cast())
-                        && let Some(iclause) = Self::match_clause_to_index(ri, ioi)
+                        && let Some(iclause) = match_clause_to_index(ri, ioi)
                     {
                         iclauses.push(iclause);
                     }
@@ -224,56 +224,6 @@ impl BitmapPlanner {
                     0,
                 );
                 return Some(bhp);
-            }
-            None
-        }
-    }
-
-    /// Mirror of the direct-match arm of core's `match_opclause_to_indexcol`: accepts
-    /// `indexkey OP pseudoconstant` with the operator in the key column's opfamily.
-    /// Clauses needing support-function derivation (LIKE prefix, PostGIS ST_DWithin)
-    /// are not yet matched.
-    unsafe fn match_clause_to_index(
-        ri: *mut pg_sys::RestrictInfo,
-        ioi: *mut pg_sys::IndexOptInfo,
-    ) -> Option<*mut pg_sys::IndexClause> {
-        unsafe {
-            let clause = (*ri).clause.cast::<pg_sys::Node>();
-            if (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
-                return None;
-            }
-            let opexpr = clause.cast::<pg_sys::OpExpr>();
-            let args = PgList::<pg_sys::Node>::from_pg((*opexpr).args);
-            if args.len() != 2 {
-                return None;
-            }
-            let (mut leftop, rightop) = (args.get_ptr(0)?, args.get_ptr(1)?);
-            if (*leftop).type_ == pg_sys::NodeTag::T_RelabelType {
-                leftop = (*leftop.cast::<pg_sys::RelabelType>()).arg.cast();
-            }
-            if pg_sys::contain_var_clause(rightop) || pg_sys::contain_volatile_functions(rightop) {
-                return None;
-            }
-
-            for indexcol in 0..(*ioi).nkeycolumns {
-                if pg_sys::match_index_to_operand(leftop, indexcol, ioi)
-                    && pg_sys::op_in_opfamily(
-                        (*opexpr).opno,
-                        *(*ioi).opfamily.add(indexcol as usize),
-                    )
-                {
-                    let iclause: *mut pg_sys::IndexClause =
-                        pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexClause>()).cast();
-                    (*iclause).type_ = pg_sys::NodeTag::T_IndexClause;
-                    (*iclause).rinfo = ri;
-                    let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
-                    indexquals.push(ri);
-                    (*iclause).indexquals = indexquals.into_pg();
-                    (*iclause).lossy = false;
-                    (*iclause).indexcol = indexcol as _;
-                    (*iclause).indexcols = std::ptr::null_mut();
-                    return Some(iclause);
-                }
             }
             None
         }
@@ -392,5 +342,52 @@ impl BitmapExec {
             );
             pg_sys::tbm_free(tbm);
         }
+    }
+}
+
+/// Mirror of the direct-match arm of core's `match_opclause_to_indexcol` (which is
+/// `static` in indxpath.c and unreachable from extensions): accepts `indexkey OP
+/// pseudoconstant` with the operator in the key column's opfamily. Clauses needing
+/// support-function derivation (LIKE prefix, PostGIS ST_DWithin) are not yet matched.
+unsafe fn match_clause_to_index(
+    ri: *mut pg_sys::RestrictInfo,
+    ioi: *mut pg_sys::IndexOptInfo,
+) -> Option<*mut pg_sys::IndexClause> {
+    unsafe {
+        let clause = (*ri).clause.cast::<pg_sys::Node>();
+        if (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
+            return None;
+        }
+        let opexpr = clause.cast::<pg_sys::OpExpr>();
+        let args = PgList::<pg_sys::Node>::from_pg((*opexpr).args);
+        if args.len() != 2 {
+            return None;
+        }
+        let (mut leftop, rightop) = (args.get_ptr(0)?, args.get_ptr(1)?);
+        if (*leftop).type_ == pg_sys::NodeTag::T_RelabelType {
+            leftop = (*leftop.cast::<pg_sys::RelabelType>()).arg.cast();
+        }
+        if pg_sys::contain_var_clause(rightop) || pg_sys::contain_volatile_functions(rightop) {
+            return None;
+        }
+
+        for indexcol in 0..(*ioi).nkeycolumns {
+            if pg_sys::match_index_to_operand(leftop, indexcol, ioi)
+                && pg_sys::op_in_opfamily((*opexpr).opno, *(*ioi).opfamily.add(indexcol as usize))
+            {
+                let iclause: *mut pg_sys::IndexClause =
+                    pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexClause>()).cast();
+                (*iclause).type_ = pg_sys::NodeTag::T_IndexClause;
+                (*iclause).rinfo = ri;
+                let mut indexquals = PgList::<pg_sys::RestrictInfo>::new();
+                indexquals.push(ri);
+                (*iclause).indexquals = indexquals.into_pg();
+                (*iclause).lossy = false;
+                (*iclause).indexcol = indexcol as _;
+                (*iclause).indexcols = std::ptr::null_mut();
+                return Some(iclause);
+            }
+        }
+        None
     }
 }
