@@ -132,8 +132,17 @@ impl BaseScan {
         // Build (or reuse) the external index's candidate set and attach it to the
         // HeapFilters that were planned against it. Must follow
         // `prepare_query_for_execution`, which re-clones the query from its base.
+        // Parallel-aware scans build the set once and share it through the query's
+        // DSA; standalone scans build locally.
+        let parallel_pstate = state.custom_state().parallel_state();
+        let es_query_dsa = unsafe { (*state.csstate.ss.ps.state).es_query_dsa };
         if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
-            let set = unsafe { bitmap_exec.candidate_set() };
+            let set = unsafe {
+                match parallel_pstate {
+                    Some(pstate) => bitmap_exec.shared_candidate_set(pstate, es_query_dsa),
+                    None => bitmap_exec.candidate_set(),
+                }
+            };
             if let Some(set) = set {
                 state.custom_state_mut().attach_tid_candidate_set(&set);
             }
@@ -869,11 +878,7 @@ impl CustomScan for BaseScan {
                 .collect(),
             );
 
-            // Only serial paths carry the bitmap child (see make_path), so parallel
-            // siblings keep the unrewritten query rather than advertising a bitmap
-            // that can never be attached.
             let mut query = SearchQueryInput::from(&quals);
-            let unrewritten_query = harvested_bitmap.as_ref().map(|_| query.clone());
             if let Some(harvested) = &harvested_bitmap {
                 harvested.rewrite_query(&mut query);
             }
@@ -1092,23 +1097,13 @@ impl CustomScan for BaseScan {
                             path_builder = path_builder.set_pathkeys(pathkeys);
                         }
 
-                        // Serial paths only: a child bitmap scan under a parallel-aware
-                        // partial path would run once per worker; sharing the bitmap
-                        // across workers is not yet supported.
-                        if nworkers.is_none()
-                            && let Some(harvested) = &harvested_bitmap
-                        {
+                        if let Some(harvested) = &harvested_bitmap {
                             let mut children = PgList::<pg_sys::Path>::new();
                             children.push(harvested.path);
                             path_builder = path_builder.set_custom_paths(children);
                         }
 
                         let mut method_private = custom_private.clone();
-                        if nworkers.is_some()
-                            && let Some(query) = &unrewritten_query
-                        {
-                            method_private.set_query(query.clone());
-                        }
                         method_private.set_exec_method_type(method.clone());
                         method_private.set_use_sorted_path(is_sorted);
                         method_private.set_worker_selection_reason(reason);

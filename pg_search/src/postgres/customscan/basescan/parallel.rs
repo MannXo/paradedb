@@ -129,6 +129,15 @@ impl ParallelQueryCapable for BaseScan {
             state
                 .custom_state_mut()
                 .attach_parallel(pscan_state, ParallelRole::Leader);
+
+            // The leader already built its candidate set when `estimate_dsm_custom_scan`
+            // opened the search reader -- before the parallel state existed. Publish it
+            // now (the build result is cached, so this claims and publishes without
+            // rebuilding) so workers attach to it instead of electing a second builder.
+            let es_query_dsa = (*state.csstate.ss.ps.state).es_query_dsa;
+            if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
+                bitmap_exec.shared_candidate_set(pscan_state, es_query_dsa);
+            }
         }
     }
 

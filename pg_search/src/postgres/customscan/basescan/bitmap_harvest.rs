@@ -442,6 +442,34 @@ impl BitmapExec {
         self.set = None;
     }
 
+    /// Parallel variant of `candidate_set`: the first participant to arrive builds the
+    /// set from its own child scan and publishes the flat bytes into the query's DSA;
+    /// every other participant waits on the shared state and reads them back.
+    /// (Parallel Bitmap Heap Scan's build-once coordination, with our own probe-able
+    /// representation instead of a shared TIDBitmap.)
+    pub unsafe fn shared_candidate_set(
+        &mut self,
+        pstate: *mut crate::postgres::ParallelScanState,
+        dsa: *mut pg_sys::dsa_area,
+    ) -> Option<Arc<TidCandidateSet>> {
+        use crate::postgres::BitmapBuildClaim;
+        unsafe {
+            if pstate.is_null() || dsa.is_null() {
+                return self.candidate_set();
+            }
+            match (*pstate).bitmap_claim_build() {
+                BitmapBuildClaim::Build => {
+                    let set = self.candidate_set();
+                    let pointer = set.as_deref().map_or(0, |set| publish_to_dsa(dsa, set));
+                    (*pstate).bitmap_publish(pointer);
+                    set
+                }
+                BitmapBuildClaim::Wait => read_from_dsa(dsa, (*pstate).bitmap_wait_done()),
+                BitmapBuildClaim::Done(pointer) => read_from_dsa(dsa, pointer),
+            }
+        }
+    }
+
     /// Run the child via `MultiExecProcNode` (first execution only) and convert its
     /// TIDBitmap into a `TidCandidateSet`.
     pub unsafe fn candidate_set(&mut self) -> Option<Arc<TidCandidateSet>> {
@@ -692,6 +720,56 @@ unsafe fn build_index_clause(
         (*iclause).indexcol = indexcol as _;
         (*iclause).indexcols = std::ptr::null_mut();
         iclause
+    }
+}
+
+/// Flat DSA layout: `[exact_len u64][lossy_len u64][recheck_len u64]` followed by the
+/// three arrays. DSA allocations are MAXALIGNed, so the typed copies below are aligned.
+unsafe fn publish_to_dsa(dsa: *mut pg_sys::dsa_area, set: &TidCandidateSet) -> pg_sys::dsa_pointer {
+    unsafe {
+        let (ne, nl, nr) = (
+            set.exact_ctids.len(),
+            set.lossy_blocks.len(),
+            set.recheck_blocks.len(),
+        );
+        let size = 24 + ne * 8 + nl * 4 + nr * 4;
+        let pointer = pg_sys::dsa_allocate_extended(dsa, size, 0);
+        let base = pg_sys::dsa_get_address(dsa, pointer).cast::<u8>();
+
+        let header = base.cast::<u64>();
+        header.write(ne as u64);
+        header.add(1).write(nl as u64);
+        header.add(2).write(nr as u64);
+
+        let mut dst = base.add(24);
+        std::ptr::copy_nonoverlapping(set.exact_ctids.as_ptr().cast::<u8>(), dst, ne * 8);
+        dst = dst.add(ne * 8);
+        std::ptr::copy_nonoverlapping(set.lossy_blocks.as_ptr().cast::<u8>(), dst, nl * 4);
+        dst = dst.add(nl * 4);
+        std::ptr::copy_nonoverlapping(set.recheck_blocks.as_ptr().cast::<u8>(), dst, nr * 4);
+        pointer
+    }
+}
+
+unsafe fn read_from_dsa(
+    dsa: *mut pg_sys::dsa_area,
+    pointer: pg_sys::dsa_pointer,
+) -> Option<Arc<TidCandidateSet>> {
+    unsafe {
+        if pointer == 0 {
+            return None;
+        }
+        let base = pg_sys::dsa_get_address(dsa, pointer).cast::<u8>();
+        let header = std::slice::from_raw_parts(base.cast::<u64>(), 3);
+        let (ne, nl, nr) = (header[0] as usize, header[1] as usize, header[2] as usize);
+        let exact = std::slice::from_raw_parts(base.add(24).cast::<u64>(), ne);
+        let lossy = std::slice::from_raw_parts(base.add(24 + ne * 8).cast::<u32>(), nl);
+        let recheck = std::slice::from_raw_parts(base.add(24 + ne * 8 + nl * 4).cast::<u32>(), nr);
+        Some(Arc::new(TidCandidateSet {
+            exact_ctids: exact.to_vec(),
+            lossy_blocks: lossy.to_vec(),
+            recheck_blocks: recheck.to_vec(),
+        }))
     }
 }
 

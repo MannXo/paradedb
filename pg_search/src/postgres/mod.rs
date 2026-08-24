@@ -697,7 +697,26 @@ pub struct ParallelScanState {
     /// Top-K Shared Threshold Fields
     pub shared_threshold: ParallelScanThresholdState,
 
+    /// Bitmap-intersection build coordination (#5702): 0 = not built, 1 = building,
+    /// 2 = done. Protected by `mutex`; waiters sleep on `bitmap_cv`.
+    bitmap_build_state: u32,
+    /// DSA pointer to the published flat `TidCandidateSet` bytes; 0 when the build
+    /// produced no set. Valid once `bitmap_build_state == 2`.
+    bitmap_dsa_pointer: pg_sys::dsa_pointer,
+    /// Condition variable for waiting on the bitmap build.
+    bitmap_cv: ConditionVariable,
+
     payload: ParallelScanPayload, // must be last field, b/c it allocates on the heap after this struct
+}
+
+/// Outcome of asking to build the shared candidate set.
+pub enum BitmapBuildClaim {
+    /// This participant won the claim and must build + publish.
+    Build,
+    /// Another participant is building; wait via `bitmap_wait_done`.
+    Wait,
+    /// The build finished; the payload is the published DSA pointer.
+    Done(pg_sys::dsa_pointer),
 }
 
 impl ParallelScanState {
@@ -744,6 +763,9 @@ impl ParallelScanState {
         self.mutex.init();
         self.aggregation_cv.init();
         self.init_cv.init();
+        self.bitmap_cv.init();
+        self.bitmap_build_state = 0;
+        self.bitmap_dsa_pointer = 0;
         self.shared_threshold.init();
         self.populate(
             &args.all_sources,
@@ -751,6 +773,43 @@ impl ParallelScanState {
             args.with_aggregates,
             args.with_segment_info,
         );
+    }
+
+    pub fn bitmap_claim_build(&mut self) -> BitmapBuildClaim {
+        let _lock = self.mutex.acquire();
+        match self.bitmap_build_state {
+            0 => {
+                self.bitmap_build_state = 1;
+                BitmapBuildClaim::Build
+            }
+            1 => BitmapBuildClaim::Wait,
+            _ => BitmapBuildClaim::Done(self.bitmap_dsa_pointer),
+        }
+    }
+
+    pub fn bitmap_publish(&mut self, pointer: pg_sys::dsa_pointer) {
+        {
+            let _lock = self.mutex.acquire();
+            self.bitmap_dsa_pointer = pointer;
+            self.bitmap_build_state = 2;
+        }
+        self.bitmap_cv.broadcast();
+    }
+
+    pub fn bitmap_wait_done(&mut self) -> pg_sys::dsa_pointer {
+        self.bitmap_cv.prepare_to_sleep();
+        loop {
+            {
+                let _lock = self.mutex.acquire();
+                if self.bitmap_build_state == 2 {
+                    break;
+                }
+            }
+            self.bitmap_cv.sleep();
+        }
+        ConditionVariable::cancel_sleep();
+        let _lock = self.mutex.acquire();
+        self.bitmap_dsa_pointer
     }
 
     /// Phase 2: Populate with actual data (assumes mutex already created via `create`).
@@ -1167,6 +1226,12 @@ impl ParallelScanState {
 
     /// Restore the per-source remaining counts for a rescan. Called by amparallelrescan.
     pub fn reset(&mut self) {
+        // Params may have changed: the bitmap must be rebuilt. The previous DSA
+        // allocation (if any) is intentionally leaked; it is freed with the query's
+        // parallel context.
+        self.bitmap_build_state = 0;
+        self.bitmap_dsa_pointer = 0;
+
         // Rescan re-partitions the same way as the initial scan, so reset every source's
         // remaining count back to its initial value.
         let counts: Vec<u32> = self.payload.all_counts().to_vec();
