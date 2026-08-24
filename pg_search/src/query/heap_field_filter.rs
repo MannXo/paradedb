@@ -289,9 +289,21 @@ unsafe extern "C-unwind" fn param_resolver_mutator(
 
 /// Row locations produced by an external index's `BitmapIndexScan`, converted into a
 /// probe-able form (#5702). `exact_ctids` uses the same `(block << 16) | offset`
-/// packing as `item_pointer_to_u64`; blocks the TIDBitmap lossified under memory
-/// pressure appear only in `lossy_blocks`; `recheck_blocks` are exact pages whose
-/// recheck bit the index AM set.
+/// packing as `item_pointer_to_u64`.
+///
+/// The two block lists record different kinds of information loss, with different
+/// consequences for pruning:
+/// - `lossy_blocks`: pages the TIDBitmap degraded under `work_mem` pressure, keeping
+///   only "this block has matches" and discarding the offsets. Membership is
+///   untestable, so nothing on these blocks can be rejected and all filters must run.
+/// - `recheck_blocks`: pages whose offsets are exact but whose matches the index AM
+///   flagged as approximate (e.g. GiST answering through bounding boxes; btree never
+///   sets this). Absent ctids are still sound rejections; present ones must also run
+///   the recheck filters.
+///
+/// Core's BitmapHeapScan collapses both into one per-page recheck bit because it
+/// visits whole pages; we probe individual ctids, so conflating them would forfeit
+/// rejection on recheck pages.
 #[derive(Debug, Default, PartialEq)]
 pub struct TidCandidateSet {
     pub exact_ctids: Vec<u64>,
@@ -311,6 +323,8 @@ pub enum TidProbe {
 impl TidCandidateSet {
     pub fn probe(&self, ctid: u64) -> TidProbe {
         let block = (ctid >> 16) as u32;
+        // Lossy blocks first: `exact_ctids` holds nothing for them, so a membership
+        // miss there must not be read as a rejection.
         if self.lossy_blocks.binary_search(&block).is_ok() {
             return TidProbe::NeedsRecheck;
         }
