@@ -16,7 +16,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 #![allow(clippy::unnecessary_cast)] // helps with integer casting differences between postgres versions
-mod bitmap_harvest;
+pub(crate) mod bitmap_harvest;
 mod cost;
 pub mod exec_methods;
 pub mod parallel;
@@ -1152,17 +1152,7 @@ impl CustomScan for BaseScan {
 
     fn plan_custom_path(mut builder: CustomScanBuilder<Self>) -> pg_sys::CustomScan {
         unsafe {
-            // create_plan_recurse can't emit a bare BitmapIndexScan, so the harvested
-            // bitmap path arrives planned as a full BitmapHeapScan; keep only its
-            // bitmap-producing subtree (BitmapIndexScan / BitmapAnd).
-            let custom_plans = PgList::<pg_sys::Plan>::from_pg(builder.custom_plans());
-            if let Some(child) = custom_plans.get_ptr(0)
-                && (*child).type_ == pg_sys::NodeTag::T_BitmapHeapScan
-            {
-                let mut replacement = PgList::<pg_sys::Plan>::new();
-                replacement.push((*child).lefttree);
-                builder.set_custom_plans(replacement.into_pg());
-            }
+            bitmap_harvest::keep_bitmap_child_plan(&mut builder);
 
             let mut tlist = PgList::<pg_sys::TargetEntry>::from_pg(builder.args().tlist.as_ptr());
 

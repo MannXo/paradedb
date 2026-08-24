@@ -122,6 +122,10 @@ pub struct AggregateScanState {
     pub aggregate_clause: AggregateCSClause,
     pub base_aggregate_clause: Option<AggregateCSClause>,
 
+    /// Execution state for the child bitmap scan, if a bitmap intersection source was
+    /// harvested at plan time.
+    pub bitmap_exec: Option<crate::postgres::customscan::basescan::bitmap_harvest::BitmapExec>,
+
     /// DataFusion backend state. When `Some`, the DataFusion path is active
     /// and the Tantivy-specific fields above are unused.
     pub datafusion_state: Option<DataFusionAggState>,

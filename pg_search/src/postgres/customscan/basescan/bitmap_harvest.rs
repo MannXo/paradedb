@@ -133,6 +133,67 @@ impl BitmapPlanner {
         })
     }
 
+    /// Like `from_query`, but for callers that only have the built `SearchQueryInput`
+    /// (the Aggregate Scan). HeapFilter expressions are collected through AND-position
+    /// structure (`must` chains and score-neutral wrappers); a HeapFilter under
+    /// `should`/`must_not` disqualifies for the same reason OR/NOT do in `from_query`.
+    pub unsafe fn from_search_query(
+        root: *mut pg_sys::PlannerInfo,
+        rel: *mut pg_sys::RelOptInfo,
+        bm25_oid: pg_sys::Oid,
+        query: &SearchQueryInput,
+    ) -> Option<Self> {
+        unsafe fn collect(sqi: &SearchQueryInput, out: &mut Vec<*mut pg_sys::Node>) -> bool {
+            unsafe {
+                match sqi {
+                    SearchQueryInput::HeapFilter {
+                        indexed_query,
+                        always_filters,
+                        ..
+                    } => {
+                        for filter in always_filters {
+                            let node = filter.get_expression_node();
+                            if !node.is_null() {
+                                out.push(node);
+                            }
+                        }
+                        collect(indexed_query, out)
+                    }
+                    SearchQueryInput::Boolean {
+                        must,
+                        should,
+                        must_not,
+                        ..
+                    } => {
+                        must.iter().all(|q| collect(q, out))
+                            && !should
+                                .iter()
+                                .chain(must_not.iter())
+                                .any(|q| q.has_heap_filters())
+                    }
+                    SearchQueryInput::Boost { query, .. }
+                    | SearchQueryInput::ConstScore { query, .. }
+                    | SearchQueryInput::WithIndex { query, .. } => collect(query, out),
+                    SearchQueryInput::ScoreFilter { query, .. } => {
+                        query.as_ref().is_none_or(|q| collect(q, out))
+                    }
+                    other => !other.has_heap_filters(),
+                }
+            }
+        }
+
+        let mut heap_exprs = Vec::new();
+        if rel.is_null() || unsafe { !collect(query, &mut heap_exprs) } || heap_exprs.is_empty() {
+            return None;
+        }
+        Some(Self {
+            root,
+            rel,
+            bm25_oid,
+            heap_exprs,
+        })
+    }
+
     /// Find a `BitmapHeapPath` usable as an intersection source. Prefers one the
     /// planner kept in the rel's pathlists; falls back to building one, since a
     /// BitmapHeapPath only survives add_path competition when it beats every other path
@@ -292,6 +353,25 @@ impl BitmapPlanner {
             self.heap_exprs
                 .iter()
                 .any(|expr| pg_sys::equal(clause.cast(), (*expr).cast()))
+        }
+    }
+}
+
+/// `create_plan_recurse` can't emit a bare `BitmapIndexScan`, so a harvested bitmap
+/// path arrives planned as a full BitmapHeapScan; keep only its bitmap-producing
+/// subtree (`BitmapIndexScan` / `BitmapAnd`). Shared by every scan type that carries a
+/// harvested child.
+pub unsafe fn keep_bitmap_child_plan<CS: crate::postgres::customscan::CustomScan>(
+    builder: &mut crate::postgres::customscan::builders::custom_scan::CustomScanBuilder<CS>,
+) {
+    unsafe {
+        let custom_plans = PgList::<pg_sys::Plan>::from_pg(builder.custom_plans());
+        if let Some(child) = custom_plans.get_ptr(0)
+            && (*child).type_ == pg_sys::NodeTag::T_BitmapHeapScan
+        {
+            let mut replacement = PgList::<pg_sys::Plan>::new();
+            replacement.push((*child).lefttree);
+            builder.set_custom_plans(replacement.into_pg());
         }
     }
 }

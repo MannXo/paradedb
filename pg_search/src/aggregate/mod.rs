@@ -42,6 +42,7 @@ use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::utils::ExprContextGuard;
 use crate::query::SearchQueryInput;
+use crate::query::heap_field_filter::TidCandidateSet;
 use crate::schema::SearchIndexSchema;
 
 use pgrx::{check_for_interrupts, pg_sys};
@@ -112,6 +113,10 @@ struct ParallelAggregation {
     config: Config,
     query_bytes: Vec<u8>,
     agg_req_bytes: Vec<u8>,
+    /// serde of `Option<TidCandidateSet>`: the query's serde skips the attached
+    /// candidate set (it must not bloat stored plans), so it ships to the workers
+    /// separately (#5702).
+    candidate_set_bytes: Vec<u8>,
     segment_ids: Vec<(SegmentId, NumDeletedDocs)>,
     ambulkdelete_epoch: u32,
 }
@@ -129,6 +134,7 @@ impl ParallelProcess for ParallelAggregation {
             &self.query_bytes,
             &self.segment_ids,
             &self.ambulkdelete_epoch,
+            &self.candidate_set_bytes,
         ]
     }
 }
@@ -160,6 +166,7 @@ impl ParallelAggregation {
             },
             agg_req_bytes: serde_json::to_vec(&aggregation)?,
             query_bytes: serde_json::to_vec(query)?,
+            candidate_set_bytes: serde_json::to_vec(&query.tid_candidate_set().as_deref())?,
             segment_ids,
             ambulkdelete_epoch,
         })
@@ -337,10 +344,21 @@ impl ParallelWorker for ParallelAggregationWorker<'_> {
             .expect("wrong type for ambulkdelete_epoch")
             .expect("missing ambulkdelete_epoch value");
 
+        let candidate_set_bytes = state_manager
+            .slice::<u8>(6)
+            .expect("wrong type for candidate_set_bytes")
+            .expect("missing candidate_set_bytes value");
+
         let aggregation = serde_json::from_slice::<AggregateRequest>(agg_req_bytes)
             .expect("agg_req_bytes should deserialize into an Aggregations");
-        let query = serde_json::from_slice::<SearchQueryInput>(query_bytes)
+        let mut query = serde_json::from_slice::<SearchQueryInput>(query_bytes)
             .expect("query_bytes should deserialize into an SearchQueryInput");
+        // The query's serde skips any attached candidate set; reattach it (#5702).
+        if let Some(set) = serde_json::from_slice::<Option<TidCandidateSet>>(candidate_set_bytes)
+            .expect("candidate_set_bytes should deserialize into an Option<TidCandidateSet>")
+        {
+            query.attach_tid_candidate_set(&std::sync::Arc::new(set));
+        }
         Self {
             state,
             config: *config,

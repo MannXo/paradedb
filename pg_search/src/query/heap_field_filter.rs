@@ -304,7 +304,7 @@ unsafe extern "C-unwind" fn param_resolver_mutator(
 /// Core's BitmapHeapScan collapses both into one per-page recheck bit because it
 /// visits whole pages; we probe individual ctids, so conflating them would forfeit
 /// rejection on recheck pages.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TidCandidateSet {
     pub exact_ctids: Vec<u64>,
     pub lossy_blocks: Vec<u32>,

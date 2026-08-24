@@ -22,6 +22,22 @@ use pgrx::{PgMemoryContexts, pg_sys};
 use std::sync::Arc;
 
 impl SearchQueryInput {
+    /// The candidate set attached to this query's HeapFilters, if any.
+    pub fn tid_candidate_set(&self) -> Option<Arc<TidCandidateSet>> {
+        let mut found = None;
+        self.visit_ref(&mut |sqi| {
+            if let SearchQueryInput::HeapFilter {
+                candidate_set: Some(set),
+                ..
+            } = sqi
+                && found.is_none()
+            {
+                found = Some(Arc::clone(set));
+            }
+        });
+        found
+    }
+
     /// Attach the execution-time candidate set to every HeapFilter that was flagged at
     /// plan time as covered by an external index's bitmap (#5702).
     pub fn attach_tid_candidate_set(&mut self, set: &Arc<TidCandidateSet>) {
