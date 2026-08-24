@@ -167,58 +167,76 @@ impl VectorSampler {
     ///
     /// `values` and `isnull` must be the arrays Postgres passes to an
     /// `IndexBuildCallback`, valid for the index's column count.
+    /// Per-row sampling callback: for each vector field, run the
+    /// content-independent reservoir lottery first and materialize
+    /// (detoast + copy) only the rows that win a slot. Rejected rows —
+    /// the large majority — are never fetched out of TOAST.
     pub unsafe fn offer(&mut self, values: *mut pg_sys::Datum, isnull: *mut bool) {
         for i in 0..self.fields.len() {
             let ordinal = self.fields[i].spec.ordinal;
             if *isnull.add(ordinal) {
                 continue;
             }
-            let datum = *values.add(ordinal);
-            let Some(vector) = PgVector::from_datum(datum, false) else {
-                continue;
-            };
-            let field = &self.fields[i];
-            if vector.0.len() != field.spec.dim {
-                panic!(
-                    "vector field '{}' expects {} dimensions, got {}",
-                    field.spec.field_name,
-                    field.spec.dim,
-                    vector.0.len()
-                );
+            if let Some(slot) = self.admit(i) {
+                self.store(i, slot, *values.add(ordinal));
             }
-            // Capacity tracks the rows seen so far, so it converges on
-            // `num_centroids * training_samples_per_centroid` without
-            // needing to know the row count up front. It only ever grows;
-            // the freed slots are filled by subsequent rows.
-            let dim = field.spec.dim;
-            let seen = field.seen;
-            let cap = (((seen + 1) as f64 * self.sample_fraction).ceil() as usize)
-                .max(MIN_RESERVOIR_ROWS);
-            // Occupied slots, which must stay DENSE: appending is the only
-            // way the reservoir grows, so a widened capacity is filled by
-            // subsequent rows instead of leaving zero-filled holes for
-            // k-means to train on.
-            let filled = field.rows.len() / dim;
-            let slot = if filled < cap {
-                Some(filled)
-            } else {
-                // Algorithm R: replace a random resident with probability
-                // cap / (seen + 1).
-                let j = (self.next_rng() % (seen as u64 + 1)) as usize;
-                (j < cap).then_some(j)
-            };
-            let field = &mut self.fields[i];
-            field.cap = cap;
-            if let Some(slot) = slot {
-                let start = slot * dim;
-                debug_assert!(start <= field.rows.len(), "reservoir must stay dense");
-                if field.rows.len() == start {
-                    field.rows.extend_from_slice(&vector.0);
-                } else {
-                    field.rows[start..start + dim].copy_from_slice(&vector.0);
-                }
-            }
-            field.seen += 1;
+        }
+    }
+
+    /// Algorithm-R admission for one vector-bearing row of field `i`,
+    /// decided from counters alone (never the row's bytes): every row is
+    /// counted in `seen`, and the returned reservoir slot (append while
+    /// spare capacity, else evict a random resident with probability
+    /// `cap / (seen + 1)`) is where the winner must be stored.
+    ///
+    /// Capacity tracks the rows seen so far, so it converges on
+    /// `num_centroids * training_samples_per_centroid` without needing to
+    /// know the row count up front. It only ever grows; the freed slots
+    /// are filled by subsequent rows.
+    fn admit(&mut self, i: usize) -> Option<usize> {
+        let field = &self.fields[i];
+        let seen = field.seen;
+        let cap =
+            (((seen + 1) as f64 * self.sample_fraction).ceil() as usize).max(MIN_RESERVOIR_ROWS);
+        // Occupied slots, which must stay DENSE: appending is the only
+        // way the reservoir grows, so a widened capacity is filled by
+        // subsequent rows instead of leaving zero-filled holes for
+        // k-means to train on.
+        let filled = field.rows.len() / field.spec.dim;
+        let slot = if filled < cap {
+            Some(filled)
+        } else {
+            let j = (self.next_rng() % (seen as u64 + 1)) as usize;
+            (j < cap).then_some(j)
+        };
+        let field = &mut self.fields[i];
+        field.cap = cap;
+        field.seen += 1;
+        slot
+    }
+
+    /// Materialize the row that won `slot` — the only point a sampled
+    /// row is detoasted and copied into the reservoir.
+    unsafe fn store(&mut self, i: usize, slot: usize, datum: pg_sys::Datum) {
+        let Some(vector) = PgVector::from_datum(datum, false) else {
+            return;
+        };
+        let field = &mut self.fields[i];
+        let dim = field.spec.dim;
+        if vector.0.len() != dim {
+            panic!(
+                "vector field '{}' expects {} dimensions, got {}",
+                field.spec.field_name,
+                dim,
+                vector.0.len()
+            );
+        }
+        let start = slot * dim;
+        debug_assert!(start <= field.rows.len(), "reservoir must stay dense");
+        if field.rows.len() == start {
+            field.rows.extend_from_slice(&vector.0);
+        } else {
+            field.rows[start..start + dim].copy_from_slice(&vector.0);
         }
     }
 
