@@ -60,8 +60,8 @@ impl SearchQueryInput {
     pub fn has_parameters(&self) -> bool {
         let mut found = false;
         self.visit_ref(&mut |sqi| {
-            if let SearchQueryInput::HeapFilter { field_filters, .. } = sqi
-                && field_filters.iter().any(|f| f.has_parameters())
+            if let SearchQueryInput::HeapFilter { always_filters, .. } = sqi
+                && always_filters.iter().any(|f| f.has_parameters())
             {
                 found = true;
             }
@@ -77,8 +77,8 @@ impl SearchQueryInput {
     pub fn collect_expression_nodes(&mut self) -> Vec<*mut pg_sys::Node> {
         let mut nodes = Vec::new();
         self.visit(&mut |sqi| match sqi {
-            SearchQueryInput::HeapFilter { field_filters, .. } => {
-                for filter in field_filters.iter() {
+            SearchQueryInput::HeapFilter { always_filters, .. } => {
+                for filter in always_filters.iter() {
                     let node = unsafe { filter.get_expression_node() };
                     if !node.is_null() {
                         nodes.push(node);
@@ -148,8 +148,8 @@ impl SearchQueryInput {
                             *sqi = SearchQueryInput::Empty;
                         }
                     }
-                    SearchQueryInput::HeapFilter { field_filters, .. } => {
-                        for filter in field_filters {
+                    SearchQueryInput::HeapFilter { always_filters, .. } => {
+                        for filter in always_filters {
                             filter.solve_parameters(expr_context);
                         }
                     }

@@ -136,9 +136,19 @@ pub enum SearchQueryInput {
     /// Mixed query with indexed search and heap field filters
     HeapFilter {
         indexed_query: Box<SearchQueryInput>,
-        field_filters: Vec<HeapFieldFilter>,
-        /// Filters that only run on docs whose bitmap membership is lossy or
-        /// recheck-flagged (#5702). Empty unless a bitmap intersection was planned.
+        /// Predicates the candidate-set bitmap cannot prove: either no external index
+        /// covers them, or the covering index qual is lossy (e.g. `ST_DWithin` matched
+        /// only through its bounding-box qual). Evaluated against the heap for every
+        /// document that survives the bitmap probe -- and for every document when no
+        /// bitmap was planned. Serialized under the field's pre-bitmap name to keep
+        /// EXPLAIN output and stored plans stable.
+        #[serde(rename = "field_filters")]
+        always_filters: Vec<HeapFieldFilter>,
+        /// Predicates proven by exact bitmap membership: their clause matched an
+        /// external index exactly (`IndexClause.lossy == false`), so a document found
+        /// in the bitmap on an exact, non-recheck page already satisfies them.
+        /// Evaluated only when that proof breaks down: a lossy page, a recheck-flagged
+        /// page, or no candidate set attached (#5702).
         #[serde(default)]
         #[serde(skip_serializing_if = "Vec::is_empty")]
         recheck_filters: Vec<HeapFieldFilter>,
@@ -1483,7 +1493,7 @@ impl SearchQueryInput {
             }
             SearchQueryInput::HeapFilter {
                 indexed_query,
-                field_filters,
+                always_filters,
                 recheck_filters,
                 uses_tid_bitmap: _,
                 candidate_set,
@@ -1500,7 +1510,7 @@ impl SearchQueryInput {
                 // Create combined query with heap field filters
                 let query = Box::new(heap_field_filter::HeapFilterQuery::new(
                     indexed_tantivy_query,
-                    field_filters.clone(),
+                    always_filters.clone(),
                     recheck_filters.clone(),
                     candidate_set.clone(),
                     relation_oid.expect("relation_oid is required for HeapFilter queries"),
@@ -2195,7 +2205,7 @@ mod tests {
         assert!(
             SearchQueryInput::HeapFilter {
                 indexed_query: Box::new(SearchQueryInput::All),
-                field_filters: vec![],
+                always_filters: vec![],
                 recheck_filters: vec![],
                 uses_tid_bitmap: false,
                 candidate_set: None,
@@ -2276,7 +2286,7 @@ mod tests {
                             lenient: None,
                             conjunction_mode: None,
                         }),
-                        field_filters: vec![],
+                        always_filters: vec![],
                         recheck_filters: vec![],
                         uses_tid_bitmap: false,
                         candidate_set: None,

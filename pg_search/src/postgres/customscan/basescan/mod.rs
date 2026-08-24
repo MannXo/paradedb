@@ -871,7 +871,7 @@ impl CustomScan for BaseScan {
 
             let mut query = SearchQueryInput::from(&quals);
             if let Some(harvested) = &harvested_bitmap {
-                unsafe { harvested.rewrite_query(&mut query) };
+                harvested.rewrite_query(&mut query);
             }
             let norm_selec = if restrict_info.len() == 1 {
                 (*restrict_info.get_ptr(0).unwrap()).norm_selec

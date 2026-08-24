@@ -65,20 +65,20 @@ impl HarvestedBitmap {
     /// Flag every HeapFilter covered by the bitmap and move filters for exactly-matched
     /// (non-lossy) clauses into `recheck_filters`: their predicate is proven by exact
     /// bitmap membership and only needs re-evaluation on lossy/recheck pages. Lossy
-    /// clauses (e.g. `ST_DWithin` behind a bbox index qual) stay in `field_filters`,
+    /// clauses (e.g. `ST_DWithin` behind a bbox index qual) stay in `always_filters`,
     /// which run on every bitmap survivor.
     pub unsafe fn rewrite_query(&self, query: &mut SearchQueryInput) {
         query.visit(&mut |sqi| {
             if let SearchQueryInput::HeapFilter {
-                field_filters,
+                always_filters,
                 recheck_filters,
                 uses_tid_bitmap,
                 ..
             } = sqi
             {
                 let mut i = 0;
-                while i < field_filters.len() {
-                    let node = unsafe { field_filters[i].get_expression_node() };
+                while i < always_filters.len() {
+                    let node = unsafe { always_filters[i].get_expression_node() };
                     let covered = self.covered.iter().find(|(clause, _)| unsafe {
                         pg_sys::equal(node.cast(), (*clause).cast())
                     });
@@ -86,7 +86,7 @@ impl HarvestedBitmap {
                         Some((_, lossy)) => {
                             *uses_tid_bitmap = true;
                             if !*lossy {
-                                recheck_filters.push(field_filters.remove(i));
+                                recheck_filters.push(always_filters.remove(i));
                                 continue;
                             }
                             i += 1;

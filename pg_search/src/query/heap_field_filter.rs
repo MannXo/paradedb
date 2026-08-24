@@ -329,7 +329,7 @@ impl TidCandidateSet {
 #[derive(Debug)]
 pub struct HeapFilterQuery {
     indexed_query: Box<dyn Query>,
-    field_filters: Vec<HeapFieldFilter>,
+    always_filters: Vec<HeapFieldFilter>,
     recheck_filters: Vec<HeapFieldFilter>,
     candidate_set: Option<Arc<TidCandidateSet>>,
     rel_oid: pg_sys::Oid,
@@ -345,7 +345,7 @@ impl HeapFilterQuery {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         indexed_query: Box<dyn Query>,
-        field_filters: Vec<HeapFieldFilter>,
+        always_filters: Vec<HeapFieldFilter>,
         recheck_filters: Vec<HeapFieldFilter>,
         candidate_set: Option<Arc<TidCandidateSet>>,
         rel_oid: pg_sys::Oid,
@@ -354,7 +354,7 @@ impl HeapFilterQuery {
     ) -> Self {
         Self {
             indexed_query,
-            field_filters,
+            always_filters,
             recheck_filters,
             candidate_set,
             rel_oid,
@@ -368,7 +368,7 @@ impl tantivy::query::QueryClone for HeapFilterQuery {
     fn box_clone(&self) -> Box<dyn Query> {
         Box::new(Self {
             indexed_query: self.indexed_query.box_clone(),
-            field_filters: self.field_filters.clone(),
+            always_filters: self.always_filters.clone(),
             recheck_filters: self.recheck_filters.clone(),
             candidate_set: self.candidate_set.clone(),
             rel_oid: self.rel_oid,
@@ -383,7 +383,7 @@ impl Query for HeapFilterQuery {
         let indexed_weight = self.indexed_query.weight(enable_scoring)?;
         Ok(Box::new(HeapFilterWeight {
             indexed_weight,
-            field_filters: self.field_filters.clone(),
+            always_filters: self.always_filters.clone(),
             recheck_filters: self.recheck_filters.clone(),
             candidate_set: self.candidate_set.clone(),
             rel_oid: self.rel_oid,
@@ -404,7 +404,7 @@ impl Query for HeapFilterQuery {
 
 struct HeapFilterWeight {
     indexed_weight: Box<dyn Weight>,
-    field_filters: Vec<HeapFieldFilter>,
+    always_filters: Vec<HeapFieldFilter>,
     recheck_filters: Vec<HeapFieldFilter>,
     candidate_set: Option<Arc<TidCandidateSet>>,
     rel_oid: pg_sys::Oid,
@@ -426,7 +426,7 @@ impl Weight for HeapFilterWeight {
 
         let scorer = HeapFilterScorer::new(
             indexed_scorer,
-            self.field_filters.clone(),
+            self.always_filters.clone(),
             self.recheck_filters.clone(),
             self.candidate_set.clone(),
             ctid_ff,
@@ -446,7 +446,10 @@ impl Weight for HeapFilterWeight {
 
 struct HeapFilterScorer {
     indexed_scorer: Box<dyn Scorer>,
-    field_filters: Vec<HeapFieldFilter>,
+    /// Evaluated on every doc that survives the bitmap probe (or every doc when no
+    /// candidate set is attached). See `SearchQueryInput::HeapFilter`.
+    always_filters: Vec<HeapFieldFilter>,
+    /// Evaluated only for lossy/recheck probes, or when no candidate set is attached.
     recheck_filters: Vec<HeapFieldFilter>,
     candidate_set: Option<Arc<TidCandidateSet>>,
     ctid_ff: crate::index::fast_fields_helper::FFType,
@@ -464,7 +467,7 @@ impl HeapFilterScorer {
     #[allow(clippy::too_many_arguments)]
     fn new(
         indexed_scorer: Box<dyn Scorer>,
-        field_filters: Vec<HeapFieldFilter>,
+        always_filters: Vec<HeapFieldFilter>,
         recheck_filters: Vec<HeapFieldFilter>,
         candidate_set: Option<Arc<TidCandidateSet>>,
         ctid_ff: crate::index::fast_fields_helper::FFType,
@@ -474,7 +477,7 @@ impl HeapFilterScorer {
     ) -> Self {
         let mut scorer = Self {
             indexed_scorer,
-            field_filters,
+            always_filters,
             recheck_filters,
             candidate_set,
             ctid_ff,
@@ -533,7 +536,7 @@ impl HeapFilterScorer {
             &mut no_filters
         };
         for filter in self
-            .field_filters
+            .always_filters
             .iter_mut()
             .chain(recheck_filters.iter_mut())
         {
