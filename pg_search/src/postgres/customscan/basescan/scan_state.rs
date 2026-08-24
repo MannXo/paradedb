@@ -155,6 +155,13 @@ impl BaseScanState {
         self.base_search_query_input = input;
     }
 
+    pub fn attach_tid_candidate_set(
+        &mut self,
+        set: &std::sync::Arc<crate::query::heap_field_filter::TidCandidateSet>,
+    ) {
+        self.search_query_input.attach_tid_candidate_set(set);
+    }
+
     pub fn search_query_input(&self) -> &SearchQueryInput {
         if matches!(self.search_query_input, SearchQueryInput::Uninitialized) {
             panic!("search_query_input should be initialized");

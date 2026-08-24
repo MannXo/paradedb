@@ -647,6 +647,9 @@ impl From<&Qual> for SearchQueryInput {
                 SearchQueryInput::HeapFilter {
                     indexed_query: search_query_input.clone(),
                     field_filters,
+                    recheck_filters: vec![],
+                    uses_tid_bitmap: false,
+                    candidate_set: None,
                 }
             }
             Qual::And(quals) => {

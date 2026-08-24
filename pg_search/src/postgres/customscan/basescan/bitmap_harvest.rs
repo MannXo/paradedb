@@ -21,8 +21,9 @@
 //!
 //! Plan time: `BitmapPlanner::from_query` gathers the coverable HeapExpr quals and
 //! `harvest` finds or builds a covering `BitmapHeapPath`, which the caller attaches as
-//! a `custom_paths` child. Execution time: `BitmapExec` runs the planned child
-//! `BitmapIndexScan` and inspects its TIDBitmap.
+//! a `custom_paths` child and rewrites the covered HeapFilters. Execution time:
+//! `BitmapExec` runs the planned child `BitmapIndexScan` and converts its TIDBitmap
+//! into the `TidCandidateSet` the HeapFilter scorer probes.
 //!
 //! Scope: a single `BitmapIndexScan` or `BitmapAnd` tree over top-level AND clauses;
 //! `BitmapOr` is rejected because a single OR arm is not a necessary condition of the
@@ -34,7 +35,10 @@
 
 use crate::postgres::customscan::qual_inspect::Qual;
 use crate::postgres::rel::PgSearchRelation;
+use crate::query::SearchQueryInput;
+use crate::query::heap_field_filter::TidCandidateSet;
 use pgrx::{PgList, pg_sys};
+use std::sync::Arc;
 
 pub struct BitmapPlanner {
     root: *mut pg_sys::PlannerInfo,
@@ -45,8 +49,54 @@ pub struct BitmapPlanner {
 
 struct HarvestedClause {
     index_name: String,
+    clause: *mut pg_sys::Node,
     lossy: bool,
     matched_heap_expr: bool,
+}
+
+/// A successful harvest: the path to attach as a `custom_paths` child, plus the
+/// HeapExpr clauses its bitmap covers (with their planner-level lossiness).
+pub struct HarvestedBitmap {
+    pub path: *mut pg_sys::Path,
+    covered: Vec<(*mut pg_sys::Node, bool)>,
+}
+
+impl HarvestedBitmap {
+    /// Flag every HeapFilter covered by the bitmap and move filters for exactly-matched
+    /// (non-lossy) clauses into `recheck_filters`: their predicate is proven by exact
+    /// bitmap membership and only needs re-evaluation on lossy/recheck pages. Lossy
+    /// clauses (e.g. `ST_DWithin` behind a bbox index qual) stay in `field_filters`,
+    /// which run on every bitmap survivor.
+    pub unsafe fn rewrite_query(&self, query: &mut SearchQueryInput) {
+        query.visit(&mut |sqi| {
+            if let SearchQueryInput::HeapFilter {
+                field_filters,
+                recheck_filters,
+                uses_tid_bitmap,
+                ..
+            } = sqi
+            {
+                let mut i = 0;
+                while i < field_filters.len() {
+                    let node = unsafe { field_filters[i].get_expression_node() };
+                    let covered = self.covered.iter().find(|(clause, _)| unsafe {
+                        pg_sys::equal(node.cast(), (*clause).cast())
+                    });
+                    match covered {
+                        Some((_, lossy)) => {
+                            *uses_tid_bitmap = true;
+                            if !*lossy {
+                                recheck_filters.push(field_filters.remove(i));
+                                continue;
+                            }
+                            i += 1;
+                        }
+                        None => i += 1,
+                    }
+                }
+            }
+        });
+    }
 }
 
 impl BitmapPlanner {
@@ -87,7 +137,7 @@ impl BitmapPlanner {
     /// planner kept in the rel's pathlists; falls back to building one, since a
     /// BitmapHeapPath only survives add_path competition when it beats every other path
     /// (usually seqscan) -- absence does not mean no index applies.
-    pub unsafe fn harvest(&self) -> Option<*mut pg_sys::Path> {
+    pub unsafe fn harvest(&self) -> Option<HarvestedBitmap> {
         unsafe {
             let mut candidates: Vec<*mut pg_sys::BitmapHeapPath> =
                 PgList::<pg_sys::Path>::from_pg((*self.rel).pathlist)
@@ -110,7 +160,7 @@ impl BitmapPlanner {
     /// Accept or reject one candidate: walk its bitmapqual tree enforcing the
     /// module-level scope rules, and require that it covers at least one of our
     /// HeapExpr clauses.
-    unsafe fn accept(&self, bhp: *mut pg_sys::BitmapHeapPath) -> Option<*mut pg_sys::Path> {
+    unsafe fn accept(&self, bhp: *mut pg_sys::BitmapHeapPath) -> Option<HarvestedBitmap> {
         unsafe {
             let mut clauses = Vec::new();
             let mut pending = vec![(*bhp).bitmapqual];
@@ -135,11 +185,12 @@ impl BitmapPlanner {
                         for iclause in
                             PgList::<pg_sys::IndexClause>::from_pg((*ip).indexclauses).iter_ptr()
                         {
+                            let clause = (*(*iclause).rinfo).clause.cast::<pg_sys::Node>();
                             clauses.push(HarvestedClause {
                                 index_name: index_name.clone(),
+                                clause,
                                 lossy: (*iclause).lossy,
-                                matched_heap_expr: self
-                                    .matches_heap_expr((*(*iclause).rinfo).clause.cast()),
+                                matched_heap_expr: self.matches_heap_expr(clause),
                             });
                         }
                     }
@@ -173,7 +224,14 @@ impl BitmapPlanner {
                 clauses.iter().filter(|c| c.matched_heap_expr).count(),
                 (*bhp).path.rows,
             );
-            Some(bhp.cast())
+            Some(HarvestedBitmap {
+                path: bhp.cast(),
+                covered: clauses
+                    .into_iter()
+                    .filter(|c| c.matched_heap_expr)
+                    .map(|c| (c.clause, c.lossy))
+                    .collect(),
+            })
         }
     }
 
@@ -239,10 +297,12 @@ impl BitmapPlanner {
 }
 
 /// Execution half: owns the initialized child `BitmapIndexScan`/`BitmapAnd` planned
-/// from the harvested path, and consumes its TIDBitmap on first execution.
+/// from the harvested path, and converts its TIDBitmap into a probe-able
+/// `TidCandidateSet` on first execution.
 pub struct BitmapExec {
     child: *mut pg_sys::PlanState,
     consumed: bool,
+    set: Option<Arc<TidCandidateSet>>,
 }
 
 impl BitmapExec {
@@ -257,6 +317,7 @@ impl BitmapExec {
             Some(Self {
                 child: pg_sys::ExecInitNode(child_plan, estate, eflags),
                 consumed: false,
+                set: None,
             })
         }
     }
@@ -269,18 +330,29 @@ impl BitmapExec {
         unsafe { pg_sys::ExecEndNode(self.child) }
     }
 
-    /// Run the child via `MultiExecProcNode` (first execution only) and report what its
-    /// TIDBitmap contains.
-    pub unsafe fn consume_and_report(&mut self) {
-        if self.consumed {
-            return;
+    /// Prepare for a rescan: params may have changed, so the bitmap must be rebuilt on
+    /// the next execution.
+    pub unsafe fn rescan(&mut self) {
+        unsafe { pg_sys::ExecReScan(self.child) };
+        self.consumed = false;
+        self.set = None;
+    }
+
+    /// Run the child via `MultiExecProcNode` (first execution only) and convert its
+    /// TIDBitmap into a `TidCandidateSet`.
+    pub unsafe fn candidate_set(&mut self) -> Option<Arc<TidCandidateSet>> {
+        if !self.consumed {
+            self.consumed = true;
+            self.set = unsafe { self.build_candidate_set() };
         }
-        self.consumed = true;
+        self.set.clone()
+    }
+
+    unsafe fn build_candidate_set(&mut self) -> Option<Arc<TidCandidateSet>> {
         unsafe {
             let result = pg_sys::MultiExecProcNode(self.child);
             if result.is_null() {
-                pgrx::notice!("[bitmap_harvest] MultiExecProcNode returned NULL");
-                return;
+                return None;
             }
             assert_eq!(
                 (*result).type_,
@@ -289,10 +361,12 @@ impl BitmapExec {
             );
             let tbm: *mut pg_sys::TIDBitmap = result.cast();
 
-            let mut pages = 0u64;
-            let mut exact_tuples = 0u64;
-            let mut lossy_pages = 0u64;
-            let mut recheck_pages = 0u64;
+            // TIDBitmap iteration returns pages in block order with ascending offsets,
+            // so the vecs below are built sorted, as `TidCandidateSet::probe` requires.
+            let mut set = TidCandidateSet::default();
+            let pack = |blockno: u32, offset: pg_sys::OffsetNumber| {
+                ((blockno as u64) << 16) | (offset as u64)
+            };
 
             #[cfg(feature = "pg18")]
             {
@@ -300,16 +374,17 @@ impl BitmapExec {
                 let mut res = pg_sys::TBMIterateResult::default();
                 let mut offsets = [0 as pg_sys::OffsetNumber; 1024];
                 while pg_sys::tbm_private_iterate(iter, &mut res) {
-                    pages += 1;
                     if res.lossy {
-                        lossy_pages += 1;
+                        set.lossy_blocks.push(res.blockno);
                     } else {
                         let ntuples =
                             pg_sys::tbm_extract_page_tuple(&mut res, offsets.as_mut_ptr(), 1024);
-                        exact_tuples += ntuples as u64;
-                    }
-                    if res.recheck {
-                        recheck_pages += 1;
+                        for &offset in &offsets[..ntuples as usize] {
+                            set.exact_ctids.push(pack(res.blockno, offset));
+                        }
+                        if res.recheck {
+                            set.recheck_blocks.push(res.blockno);
+                        }
                     }
                 }
                 pg_sys::tbm_end_private_iterate(iter);
@@ -323,24 +398,28 @@ impl BitmapExec {
                     if res.is_null() {
                         break;
                     }
-                    pages += 1;
                     if (*res).ntuples < 0 {
-                        lossy_pages += 1;
+                        set.lossy_blocks.push((*res).blockno);
                     } else {
-                        exact_tuples += (*res).ntuples as u64;
-                    }
-                    if (*res).recheck {
-                        recheck_pages += 1;
+                        for &offset in (*res).offsets.as_slice((*res).ntuples as usize) {
+                            set.exact_ctids.push(pack((*res).blockno, offset));
+                        }
+                        if (*res).recheck {
+                            set.recheck_blocks.push((*res).blockno);
+                        }
                     }
                 }
                 pg_sys::tbm_end_iterate(iter);
             }
 
-            pgrx::notice!(
-                "[bitmap_harvest] TIDBitmap: {pages} pages ({exact_tuples} exact tuples, \
-                 {lossy_pages} lossy pages, {recheck_pages} recheck pages)"
-            );
             pg_sys::tbm_free(tbm);
+            pgrx::notice!(
+                "[bitmap_harvest] TidCandidateSet: {} exact ctids, {} lossy blocks, {} recheck blocks",
+                set.exact_ctids.len(),
+                set.lossy_blocks.len(),
+                set.recheck_blocks.len(),
+            );
+            Some(Arc::new(set))
         }
     }
 }

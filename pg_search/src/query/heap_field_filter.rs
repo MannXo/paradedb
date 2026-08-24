@@ -16,6 +16,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use crate::postgres::heap::HeapFetchState;
 use crate::postgres::rel::PgSearchRelation;
@@ -286,11 +287,51 @@ unsafe extern "C-unwind" fn param_resolver_mutator(
     }
 }
 
+/// Row locations produced by an external index's `BitmapIndexScan`, converted into a
+/// probe-able form (#5702). `exact_ctids` uses the same `(block << 16) | offset`
+/// packing as `item_pointer_to_u64`; blocks the TIDBitmap lossified under memory
+/// pressure appear only in `lossy_blocks`; `recheck_blocks` are exact pages whose
+/// recheck bit the index AM set.
+#[derive(Debug, Default, PartialEq)]
+pub struct TidCandidateSet {
+    pub exact_ctids: Vec<u64>,
+    pub lossy_blocks: Vec<u32>,
+    pub recheck_blocks: Vec<u32>,
+}
+
+pub enum TidProbe {
+    /// Not in the bitmap: the row cannot match, skip it with zero heap access.
+    Reject,
+    /// In the bitmap with exact, non-recheck membership.
+    Candidate,
+    /// Membership is lossy or flagged: recheck filters must also be evaluated.
+    NeedsRecheck,
+}
+
+impl TidCandidateSet {
+    pub fn probe(&self, ctid: u64) -> TidProbe {
+        let block = (ctid >> 16) as u32;
+        if self.lossy_blocks.binary_search(&block).is_ok() {
+            return TidProbe::NeedsRecheck;
+        }
+        if self.exact_ctids.binary_search(&ctid).is_err() {
+            return TidProbe::Reject;
+        }
+        if self.recheck_blocks.binary_search(&block).is_ok() {
+            TidProbe::NeedsRecheck
+        } else {
+            TidProbe::Candidate
+        }
+    }
+}
+
 /// Tantivy query that combines indexed search with heap field filtering
 #[derive(Debug)]
 pub struct HeapFilterQuery {
     indexed_query: Box<dyn Query>,
     field_filters: Vec<HeapFieldFilter>,
+    recheck_filters: Vec<HeapFieldFilter>,
+    candidate_set: Option<Arc<TidCandidateSet>>,
     rel_oid: pg_sys::Oid,
     expr_context: NonNull<pg_sys::ExprContext>,
     planstate: Option<NonNull<pg_sys::PlanState>>,
@@ -301,9 +342,12 @@ unsafe impl Send for HeapFilterQuery {}
 unsafe impl Sync for HeapFilterQuery {}
 
 impl HeapFilterQuery {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         indexed_query: Box<dyn Query>,
         field_filters: Vec<HeapFieldFilter>,
+        recheck_filters: Vec<HeapFieldFilter>,
+        candidate_set: Option<Arc<TidCandidateSet>>,
         rel_oid: pg_sys::Oid,
         expr_context: NonNull<pg_sys::ExprContext>,
         planstate: Option<NonNull<pg_sys::PlanState>>,
@@ -311,6 +355,8 @@ impl HeapFilterQuery {
         Self {
             indexed_query,
             field_filters,
+            recheck_filters,
+            candidate_set,
             rel_oid,
             expr_context,
             planstate,
@@ -323,6 +369,8 @@ impl tantivy::query::QueryClone for HeapFilterQuery {
         Box::new(Self {
             indexed_query: self.indexed_query.box_clone(),
             field_filters: self.field_filters.clone(),
+            recheck_filters: self.recheck_filters.clone(),
+            candidate_set: self.candidate_set.clone(),
             rel_oid: self.rel_oid,
             expr_context: self.expr_context,
             planstate: self.planstate,
@@ -336,6 +384,8 @@ impl Query for HeapFilterQuery {
         Ok(Box::new(HeapFilterWeight {
             indexed_weight,
             field_filters: self.field_filters.clone(),
+            recheck_filters: self.recheck_filters.clone(),
+            candidate_set: self.candidate_set.clone(),
             rel_oid: self.rel_oid,
             expr_context: self.expr_context,
             planstate: self.planstate,
@@ -355,6 +405,8 @@ impl Query for HeapFilterQuery {
 struct HeapFilterWeight {
     indexed_weight: Box<dyn Weight>,
     field_filters: Vec<HeapFieldFilter>,
+    recheck_filters: Vec<HeapFieldFilter>,
+    candidate_set: Option<Arc<TidCandidateSet>>,
     rel_oid: pg_sys::Oid,
     expr_context: NonNull<pg_sys::ExprContext>,
     planstate: Option<NonNull<pg_sys::PlanState>>,
@@ -375,6 +427,8 @@ impl Weight for HeapFilterWeight {
         let scorer = HeapFilterScorer::new(
             indexed_scorer,
             self.field_filters.clone(),
+            self.recheck_filters.clone(),
+            self.candidate_set.clone(),
             ctid_ff,
             self.rel_oid,
             self.expr_context,
@@ -393,6 +447,8 @@ impl Weight for HeapFilterWeight {
 struct HeapFilterScorer {
     indexed_scorer: Box<dyn Scorer>,
     field_filters: Vec<HeapFieldFilter>,
+    recheck_filters: Vec<HeapFieldFilter>,
+    candidate_set: Option<Arc<TidCandidateSet>>,
     ctid_ff: crate::index::fast_fields_helper::FFType,
     heaprel: PgSearchRelation,
     current_doc: DocId,
@@ -405,9 +461,12 @@ unsafe impl Send for HeapFilterScorer {}
 unsafe impl Sync for HeapFilterScorer {}
 
 impl HeapFilterScorer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         indexed_scorer: Box<dyn Scorer>,
         field_filters: Vec<HeapFieldFilter>,
+        recheck_filters: Vec<HeapFieldFilter>,
+        candidate_set: Option<Arc<TidCandidateSet>>,
         ctid_ff: crate::index::fast_fields_helper::FFType,
         rel_oid: pg_sys::Oid,
         expr_context: NonNull<pg_sys::ExprContext>,
@@ -416,6 +475,8 @@ impl HeapFilterScorer {
         let mut scorer = Self {
             indexed_scorer,
             field_filters,
+            recheck_filters,
+            candidate_set,
             ctid_ff,
             heaprel: PgSearchRelation::open(rel_oid),
             current_doc: TERMINATED,
@@ -447,12 +508,35 @@ impl HeapFilterScorer {
         let Some(ctid_value) = self.ctid_ff.as_u64(doc_id) else {
             panic!("Could not get ctid for doc_id: {doc_id}");
         };
+
+        // Probe the external index's bitmap first: a miss rejects the doc with zero
+        // heap access, and exact non-recheck membership skips the recheck filters.
+        // With no candidate set attached, both filter lists must run: the bitmap
+        // proof the recheck split relies on doesn't exist.
+        let needs_recheck_filters = match &self.candidate_set {
+            Some(set) => match set.probe(ctid_value) {
+                TidProbe::Reject => return false,
+                TidProbe::Candidate => false,
+                TidProbe::NeedsRecheck => true,
+            },
+            None => true,
+        };
+
         // Convert u64 ctid back to ItemPointer
         let mut item_pointer = pg_sys::ItemPointerData::default();
         crate::postgres::utils::u64_to_item_pointer(ctid_value, &mut item_pointer);
 
-        // Evaluate all heap filters
-        for filter in self.field_filters.iter_mut() {
+        let mut no_filters = Vec::new();
+        let recheck_filters = if needs_recheck_filters {
+            &mut self.recheck_filters
+        } else {
+            &mut no_filters
+        };
+        for filter in self
+            .field_filters
+            .iter_mut()
+            .chain(recheck_filters.iter_mut())
+        {
             unsafe {
                 let filter_result = filter.evaluate(
                     &mut item_pointer as *mut pg_sys::ItemPointerData,

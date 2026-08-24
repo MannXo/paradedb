@@ -27,7 +27,8 @@ mod score;
 
 use builder::{QueryBuilder, QueryOnlyBuilder, QueryTreeBuilder};
 use estimate_tree::QueryWithEstimates;
-use heap_field_filter::HeapFieldFilter;
+use heap_field_filter::{HeapFieldFilter, TidCandidateSet};
+use std::sync::Arc;
 
 use crate::api::FieldName;
 use crate::api::HashMap;
@@ -59,6 +60,10 @@ use tantivy::{
     schema::{DATE_TIME_PRECISION_INDEXED, Field, FieldType},
 };
 use thiserror::Error;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, PostgresType, Deserialize, Serialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +137,18 @@ pub enum SearchQueryInput {
     HeapFilter {
         indexed_query: Box<SearchQueryInput>,
         field_filters: Vec<HeapFieldFilter>,
+        /// Filters that only run on docs whose bitmap membership is lossy or
+        /// recheck-flagged (#5702). Empty unless a bitmap intersection was planned.
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        recheck_filters: Vec<HeapFieldFilter>,
+        /// Set at plan time when an external index's bitmap covers this filter's
+        /// clauses; the candidate set itself is attached at execution time.
+        #[serde(default)]
+        #[serde(skip_serializing_if = "is_false")]
+        uses_tid_bitmap: bool,
+        #[serde(skip)]
+        candidate_set: Option<Arc<TidCandidateSet>>,
     },
 
     #[serde(serialize_with = "serialize_fielded_query")]
@@ -1467,6 +1484,9 @@ impl SearchQueryInput {
             SearchQueryInput::HeapFilter {
                 indexed_query,
                 field_filters,
+                recheck_filters,
+                uses_tid_bitmap: _,
+                candidate_set,
             } => {
                 // Convert indexed query first
                 let inner_output = recurse(*indexed_query)?;
@@ -1481,6 +1501,8 @@ impl SearchQueryInput {
                 let query = Box::new(heap_field_filter::HeapFilterQuery::new(
                     indexed_tantivy_query,
                     field_filters.clone(),
+                    recheck_filters.clone(),
+                    candidate_set.clone(),
                     relation_oid.expect("relation_oid is required for HeapFilter queries"),
                     expr_context,
                     planstate,
@@ -2174,6 +2196,9 @@ mod tests {
             SearchQueryInput::HeapFilter {
                 indexed_query: Box::new(SearchQueryInput::All),
                 field_filters: vec![],
+                recheck_filters: vec![],
+                uses_tid_bitmap: false,
+                candidate_set: None,
             }
             .is_full_scan_query()
         );
@@ -2252,6 +2277,9 @@ mod tests {
                             conjunction_mode: None,
                         }),
                         field_filters: vec![],
+                        recheck_filters: vec![],
+                        uses_tid_bitmap: false,
+                        candidate_set: None,
                     }),
                 }],
                 tie_breaker: None,

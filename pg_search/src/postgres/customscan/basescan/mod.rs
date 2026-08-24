@@ -129,6 +129,16 @@ impl BaseScan {
             .custom_state_mut()
             .prepare_query_for_execution(planstate, expr_context);
 
+        // Build (or reuse) the external index's candidate set and attach it to the
+        // HeapFilters that were planned against it. Must follow
+        // `prepare_query_for_execution`, which re-clones the query from its base.
+        if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
+            let set = unsafe { bitmap_exec.candidate_set() };
+            if let Some(set) = set {
+                state.custom_state_mut().attach_tid_candidate_set(&set);
+            }
+        }
+
         // Open the index
         let indexrel = state
             .custom_state()
@@ -753,13 +763,13 @@ impl CustomScan for BaseScan {
                 return None;
             }
 
-            let harvested_bitmap_path = bitmap_harvest::BitmapPlanner::from_query(
+            let harvested_bitmap = bitmap_harvest::BitmapPlanner::from_query(
                 root,
                 builder.args().rel,
                 bm25_index.oid(),
                 &quals,
             )
-            .and_then(|harvester| harvester.harvest());
+            .and_then(|planner| planner.harvest());
 
             //
             // ===================
@@ -859,7 +869,10 @@ impl CustomScan for BaseScan {
                 .collect(),
             );
 
-            let query = SearchQueryInput::from(&quals);
+            let mut query = SearchQueryInput::from(&quals);
+            if let Some(harvested) = &harvested_bitmap {
+                unsafe { harvested.rewrite_query(&mut query) };
+            }
             let norm_selec = if restrict_info.len() == 1 {
                 (*restrict_info.get_ptr(0).unwrap()).norm_selec
             } else {
@@ -1079,10 +1092,10 @@ impl CustomScan for BaseScan {
                         // partial path would run once per worker; sharing the bitmap
                         // across workers is not yet supported.
                         if nworkers.is_none()
-                            && let Some(bitmap_path) = harvested_bitmap_path
+                            && let Some(harvested) = &harvested_bitmap
                         {
                             let mut children = PgList::<pg_sys::Path>::new();
-                            children.push(bitmap_path);
+                            children.push(harvested.path);
                             path_builder = path_builder.set_custom_paths(children);
                         }
 
@@ -1681,6 +1694,9 @@ impl CustomScan for BaseScan {
     }
 
     fn rescan_custom_scan(state: &mut CustomScanStateWrapper<Self>) {
+        if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
+            unsafe { bitmap_exec.rescan() };
+        }
         Self::init_search_reader(state);
         state.custom_state_mut().reset();
     }
@@ -1689,10 +1705,6 @@ impl CustomScan for BaseScan {
     fn exec_custom_scan(state: &mut CustomScanStateWrapper<Self>) -> *mut pg_sys::TupleTableSlot {
         if state.custom_state().search_reader.is_none() {
             Self::init_search_reader(state);
-        }
-
-        if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
-            unsafe { bitmap_exec.consume_and_report() };
         }
 
         loop {
