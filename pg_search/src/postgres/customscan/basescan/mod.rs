@@ -753,7 +753,7 @@ impl CustomScan for BaseScan {
                 return None;
             }
 
-            let harvested_bitmap_path = bitmap_harvest::BitmapHarvester::new(
+            let harvested_bitmap_path = bitmap_harvest::BitmapHarvester::from_query(
                 root,
                 builder.args().rel,
                 bm25_index.oid(),

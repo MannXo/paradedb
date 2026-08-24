@@ -19,7 +19,7 @@
 //! bitmapqual covers quals we would otherwise evaluate as a `heap_filter`, so the
 //! index's TIDBitmap can be intersected with the Tantivy result set (#5702).
 //!
-//! Plan time: `BitmapHarvester::new` gathers the coverable HeapExpr quals and
+//! Plan time: `BitmapHarvester::from_query` gathers the coverable HeapExpr quals and
 //! `harvest` finds or builds a covering `BitmapHeapPath`, which the caller attaches as
 //! a `custom_paths` child. Execution time: `consume_and_report` runs the planned child
 //! `BitmapIndexScan` and inspects its TIDBitmap.
@@ -53,7 +53,7 @@ impl BitmapHarvester {
     /// Collect the expr node of every `Qual::HeapExpr` reachable through top-level AND
     /// structure. Returns `None` when there is nothing to cover, or when a HeapExpr
     /// appears under OR/NOT, where its bitmap could not be used to reject rows.
-    pub fn new(
+    pub fn from_query(
         root: *mut pg_sys::PlannerInfo,
         rel: *mut pg_sys::RelOptInfo,
         bm25_oid: pg_sys::Oid,
@@ -103,40 +103,14 @@ impl BitmapHarvester {
                 candidates.push(bhp);
             }
 
-            candidates
-                .into_iter()
-                .find_map(|bhp| match self.validate(bhp) {
-                    Ok(clauses) => {
-                        for clause in &clauses {
-                            pgrx::notice!(
-                                "[bitmap_harvest] index={} lossy={} matched_heap_expr={}",
-                                clause.index_name,
-                                clause.lossy,
-                                clause.matched_heap_expr,
-                            );
-                        }
-                        pgrx::notice!(
-                            "[bitmap_harvest] harvested BitmapHeapPath: {} index clause(s), {} matched heap_filter clause(s), est rows={:.0}",
-                            clauses.len(),
-                            clauses.iter().filter(|c| c.matched_heap_expr).count(),
-                            (*bhp).path.rows,
-                        );
-                        Some(bhp.cast::<pg_sys::Path>())
-                    }
-                    Err(rejection) => {
-                        pgrx::notice!("[bitmap_harvest] skipping BitmapHeapPath: {rejection}");
-                        None
-                    }
-                })
+            candidates.into_iter().find_map(|bhp| self.accept(bhp))
         }
     }
 
-    /// Walk the candidate's bitmapqual tree, enforcing the module-level scope rules and
-    /// classifying every `IndexClause` found along the way.
-    unsafe fn validate(
-        &self,
-        bhp: *mut pg_sys::BitmapHeapPath,
-    ) -> Result<Vec<HarvestedClause>, &'static str> {
+    /// Accept or reject one candidate: walk its bitmapqual tree enforcing the
+    /// module-level scope rules, and require that it covers at least one of our
+    /// HeapExpr clauses.
+    unsafe fn accept(&self, bhp: *mut pg_sys::BitmapHeapPath) -> Option<*mut pg_sys::Path> {
         unsafe {
             let mut clauses = Vec::new();
             let mut pending = vec![(*bhp).bitmapqual];
@@ -152,7 +126,10 @@ impl BitmapHarvester {
                         let ip: *mut pg_sys::IndexPath = path.cast();
                         let indexoid = (*(*ip).indexinfo).indexoid;
                         if indexoid == self.bm25_oid {
-                            return Err("bitmapqual is over the BM25 index itself");
+                            pgrx::notice!(
+                                "[bitmap_harvest] skipping BitmapHeapPath: bitmapqual is over the BM25 index itself"
+                            );
+                            return None;
                         }
                         let index_name = PgSearchRelation::open(indexoid).name().to_string();
                         for iclause in
@@ -166,15 +143,37 @@ impl BitmapHarvester {
                             });
                         }
                     }
-                    _ => return Err("bitmapqual contains BitmapOr"),
+                    _ => {
+                        pgrx::notice!(
+                            "[bitmap_harvest] skipping BitmapHeapPath: bitmapqual contains BitmapOr"
+                        );
+                        return None;
+                    }
                 }
             }
 
-            if clauses.iter().any(|c| c.matched_heap_expr) {
-                Ok(clauses)
-            } else {
-                Err("covers no heap_filter clause")
+            if !clauses.iter().any(|c| c.matched_heap_expr) {
+                pgrx::notice!(
+                    "[bitmap_harvest] skipping BitmapHeapPath: covers no heap_filter clause"
+                );
+                return None;
             }
+
+            for clause in &clauses {
+                pgrx::notice!(
+                    "[bitmap_harvest] index={} lossy={} matched_heap_expr={}",
+                    clause.index_name,
+                    clause.lossy,
+                    clause.matched_heap_expr,
+                );
+            }
+            pgrx::notice!(
+                "[bitmap_harvest] harvested BitmapHeapPath: {} index clause(s), {} matched heap_filter clause(s), est rows={:.0}",
+                clauses.len(),
+                clauses.iter().filter(|c| c.matched_heap_expr).count(),
+                (*bhp).path.rows,
+            );
+            Some(bhp.cast())
         }
     }
 
