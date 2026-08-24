@@ -869,7 +869,11 @@ impl CustomScan for BaseScan {
                 .collect(),
             );
 
+            // Only serial paths carry the bitmap child (see make_path), so parallel
+            // siblings keep the unrewritten query rather than advertising a bitmap
+            // that can never be attached.
             let mut query = SearchQueryInput::from(&quals);
+            let unrewritten_query = harvested_bitmap.as_ref().map(|_| query.clone());
             if let Some(harvested) = &harvested_bitmap {
                 harvested.rewrite_query(&mut query);
             }
@@ -1100,6 +1104,11 @@ impl CustomScan for BaseScan {
                         }
 
                         let mut method_private = custom_private.clone();
+                        if nworkers.is_some()
+                            && let Some(query) = &unrewritten_query
+                        {
+                            method_private.set_query(query.clone());
+                        }
                         method_private.set_exec_method_type(method.clone());
                         method_private.set_use_sorted_path(is_sorted);
                         method_private.set_worker_selection_reason(reason);
@@ -1477,6 +1486,16 @@ impl CustomScan for BaseScan {
     ) {
         explainer.add_text("Table", state.custom_state().heaprelname());
         explainer.add_text("Index", state.custom_state().indexrelname());
+        if let Some(bitmap_exec) = state.custom_state().bitmap_exec.as_ref() {
+            explainer.add_text("Bitmap Intersection", bitmap_exec.index_name());
+            if explainer.is_analyze()
+                && let Some((exact, lossy, recheck)) = bitmap_exec.candidate_stats()
+            {
+                explainer.add_unsigned_integer("Bitmap Exact Candidates", exact as u64, None);
+                explainer.add_unsigned_integer("Bitmap Lossy Blocks", lossy as u64, None);
+                explainer.add_unsigned_integer("Bitmap Recheck Blocks", recheck as u64, None);
+            }
+        }
         if explainer.is_costs() {
             explainer.add_unsigned_integer(
                 "Segment Count",
@@ -1629,21 +1648,22 @@ impl CustomScan for BaseScan {
 
             state.custom_state_mut().open_relations(lockmode);
 
-            // For EXPLAIN ANALYZE queries, we need to continue with full initialization
-            // For EXPLAIN-only (without ANALYZE), begin_custom_scan is not called at all
-            if eflags & (pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32) != 0 {
-                // don't do anything else if we're only explaining the query
-                return;
-            }
-
             // Initialize the harvested child bitmap scan, if any; registering it in
-            // custom_ps lets EXPLAIN render it.
+            // custom_ps lets EXPLAIN render it. Runs before the EXPLAIN-only return so
+            // plain EXPLAIN shows the child node too (node init does no scan work).
             let cscan = state.csstate.ss.ps.plan.cast::<pg_sys::CustomScan>();
             if let Some(bitmap_exec) = bitmap_harvest::BitmapExec::init(cscan, estate, eflags) {
                 let mut custom_ps = PgList::<pg_sys::PlanState>::from_pg(state.csstate.custom_ps);
                 custom_ps.push(bitmap_exec.planstate());
                 state.csstate.custom_ps = custom_ps.into_pg();
                 state.custom_state_mut().bitmap_exec = Some(bitmap_exec);
+            }
+
+            // For EXPLAIN ANALYZE queries, we need to continue with full initialization
+            // For EXPLAIN-only (without ANALYZE), begin_custom_scan is not called at all
+            if eflags & (pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32) != 0 {
+                // don't do anything else if we're only explaining the query
+                return;
             }
 
             // setup the structures we need to do mvcc checking and heap fetching

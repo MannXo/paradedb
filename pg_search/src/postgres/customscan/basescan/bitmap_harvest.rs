@@ -326,6 +326,30 @@ impl BitmapExec {
         self.child
     }
 
+    pub fn index_name(&self) -> String {
+        unsafe {
+            let plan = (*self.child).plan;
+            if (*plan).type_ == pg_sys::NodeTag::T_BitmapIndexScan {
+                PgSearchRelation::open((*plan.cast::<pg_sys::BitmapIndexScan>()).indexid)
+                    .name()
+                    .to_string()
+            } else {
+                "multiple indexes".to_string()
+            }
+        }
+    }
+
+    /// (exact ctids, lossy blocks, recheck blocks) once the set has been built.
+    pub fn candidate_stats(&self) -> Option<(usize, usize, usize)> {
+        self.set.as_ref().map(|set| {
+            (
+                set.exact_ctids.len(),
+                set.lossy_blocks.len(),
+                set.recheck_blocks.len(),
+            )
+        })
+    }
+
     pub unsafe fn shutdown(self) {
         unsafe { pg_sys::ExecEndNode(self.child) }
     }
