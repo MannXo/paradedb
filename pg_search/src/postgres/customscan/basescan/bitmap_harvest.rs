@@ -19,9 +19,9 @@
 //! bitmapqual covers quals we would otherwise evaluate as a `heap_filter`, so the
 //! index's TIDBitmap can be intersected with the Tantivy result set (#5702).
 //!
-//! Plan time: `BitmapHarvester::from_query` gathers the coverable HeapExpr quals and
+//! Plan time: `BitmapPlanner::from_query` gathers the coverable HeapExpr quals and
 //! `harvest` finds or builds a covering `BitmapHeapPath`, which the caller attaches as
-//! a `custom_paths` child. Execution time: `consume_and_report` runs the planned child
+//! a `custom_paths` child. Execution time: `BitmapExec` runs the planned child
 //! `BitmapIndexScan` and inspects its TIDBitmap.
 //!
 //! Scope: a single `BitmapIndexScan` or `BitmapAnd` tree over top-level AND clauses;
@@ -36,7 +36,7 @@ use crate::postgres::customscan::qual_inspect::Qual;
 use crate::postgres::rel::PgSearchRelation;
 use pgrx::{PgList, pg_sys};
 
-pub struct BitmapHarvester {
+pub struct BitmapPlanner {
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     bm25_oid: pg_sys::Oid,
@@ -49,10 +49,10 @@ struct HarvestedClause {
     matched_heap_expr: bool,
 }
 
-impl BitmapHarvester {
+impl BitmapPlanner {
     /// Collect the expr node of every `Qual::HeapExpr` reachable through top-level AND
     /// structure. Returns `None` when there is nothing to cover, or when a HeapExpr
-    /// appears under OR/NOT, where its bitmap could not be used to reject rows.
+    /// appears under OR/NOT, where its bitmap could not be used to reject rows (todo)
     pub fn from_query(
         root: *mut pg_sys::PlannerInfo,
         rel: *mut pg_sys::RelOptInfo,
@@ -202,12 +202,6 @@ impl BitmapHarvester {
                 if iclauses.is_empty() {
                     continue;
                 }
-
-                pgrx::notice!(
-                    "[bitmap_harvest] directly built IndexPath over {} with {} clause(s)",
-                    PgSearchRelation::open((*ioi).indexoid).name(),
-                    iclauses.len()
-                );
                 let ipath = pg_sys::create_index_path(
                     self.root,
                     ioi,
@@ -294,73 +288,109 @@ impl BitmapHarvester {
     }
 }
 
-/// Run the child `BitmapIndexScan` via `MultiExecProcNode` and report what its
-/// TIDBitmap contains.
-pub unsafe fn consume_and_report(child: *mut pg_sys::PlanState) {
-    unsafe {
-        let result = pg_sys::MultiExecProcNode(child);
-        if result.is_null() {
-            pgrx::notice!("[bitmap_harvest] MultiExecProcNode returned NULL");
+/// Execution half: owns the initialized child `BitmapIndexScan`/`BitmapAnd` planned
+/// from the harvested path, and consumes its TIDBitmap on first execution.
+pub struct BitmapExec {
+    child: *mut pg_sys::PlanState,
+    consumed: bool,
+}
+
+impl BitmapExec {
+    /// Initialize the CustomScan's planned child bitmap scan, if it carries one.
+    pub unsafe fn init(
+        cscan: *mut pg_sys::CustomScan,
+        estate: *mut pg_sys::EState,
+        eflags: i32,
+    ) -> Option<Self> {
+        unsafe {
+            let child_plan = PgList::<pg_sys::Plan>::from_pg((*cscan).custom_plans).get_ptr(0)?;
+            Some(Self {
+                child: pg_sys::ExecInitNode(child_plan, estate, eflags),
+                consumed: false,
+            })
+        }
+    }
+
+    pub fn planstate(&self) -> *mut pg_sys::PlanState {
+        self.child
+    }
+
+    pub unsafe fn shutdown(self) {
+        unsafe { pg_sys::ExecEndNode(self.child) }
+    }
+
+    /// Run the child via `MultiExecProcNode` (first execution only) and report what its
+    /// TIDBitmap contains.
+    pub unsafe fn consume_and_report(&mut self) {
+        if self.consumed {
             return;
         }
-        assert_eq!(
-            (*result).type_,
-            pg_sys::NodeTag::T_TIDBitmap,
-            "MultiExecProcNode must return a TIDBitmap"
-        );
-        let tbm: *mut pg_sys::TIDBitmap = result.cast();
-
-        let mut pages = 0u64;
-        let mut exact_tuples = 0u64;
-        let mut lossy_pages = 0u64;
-        let mut recheck_pages = 0u64;
-
-        #[cfg(feature = "pg18")]
-        {
-            let iter = pg_sys::tbm_begin_private_iterate(tbm);
-            let mut res = pg_sys::TBMIterateResult::default();
-            let mut offsets = [0 as pg_sys::OffsetNumber; 1024];
-            while pg_sys::tbm_private_iterate(iter, &mut res) {
-                pages += 1;
-                if res.lossy {
-                    lossy_pages += 1;
-                } else {
-                    let ntuples =
-                        pg_sys::tbm_extract_page_tuple(&mut res, offsets.as_mut_ptr(), 1024);
-                    exact_tuples += ntuples as u64;
-                }
-                if res.recheck {
-                    recheck_pages += 1;
-                }
+        self.consumed = true;
+        unsafe {
+            let result = pg_sys::MultiExecProcNode(self.child);
+            if result.is_null() {
+                pgrx::notice!("[bitmap_harvest] MultiExecProcNode returned NULL");
+                return;
             }
-            pg_sys::tbm_end_private_iterate(iter);
-        }
+            assert_eq!(
+                (*result).type_,
+                pg_sys::NodeTag::T_TIDBitmap,
+                "MultiExecProcNode must return a TIDBitmap"
+            );
+            let tbm: *mut pg_sys::TIDBitmap = result.cast();
 
-        #[cfg(not(feature = "pg18"))]
-        {
-            let iter = pg_sys::tbm_begin_iterate(tbm);
-            loop {
-                let res = pg_sys::tbm_iterate(iter);
-                if res.is_null() {
-                    break;
+            let mut pages = 0u64;
+            let mut exact_tuples = 0u64;
+            let mut lossy_pages = 0u64;
+            let mut recheck_pages = 0u64;
+
+            #[cfg(feature = "pg18")]
+            {
+                let iter = pg_sys::tbm_begin_private_iterate(tbm);
+                let mut res = pg_sys::TBMIterateResult::default();
+                let mut offsets = [0 as pg_sys::OffsetNumber; 1024];
+                while pg_sys::tbm_private_iterate(iter, &mut res) {
+                    pages += 1;
+                    if res.lossy {
+                        lossy_pages += 1;
+                    } else {
+                        let ntuples =
+                            pg_sys::tbm_extract_page_tuple(&mut res, offsets.as_mut_ptr(), 1024);
+                        exact_tuples += ntuples as u64;
+                    }
+                    if res.recheck {
+                        recheck_pages += 1;
+                    }
                 }
-                pages += 1;
-                if (*res).ntuples < 0 {
-                    lossy_pages += 1;
-                } else {
-                    exact_tuples += (*res).ntuples as u64;
-                }
-                if (*res).recheck {
-                    recheck_pages += 1;
-                }
+                pg_sys::tbm_end_private_iterate(iter);
             }
-            pg_sys::tbm_end_iterate(iter);
-        }
 
-        pgrx::notice!(
-            "[bitmap_harvest] TIDBitmap: {pages} pages ({exact_tuples} exact tuples, \
-             {lossy_pages} lossy pages, {recheck_pages} recheck pages)"
-        );
-        pg_sys::tbm_free(tbm);
+            #[cfg(not(feature = "pg18"))]
+            {
+                let iter = pg_sys::tbm_begin_iterate(tbm);
+                loop {
+                    let res = pg_sys::tbm_iterate(iter);
+                    if res.is_null() {
+                        break;
+                    }
+                    pages += 1;
+                    if (*res).ntuples < 0 {
+                        lossy_pages += 1;
+                    } else {
+                        exact_tuples += (*res).ntuples as u64;
+                    }
+                    if (*res).recheck {
+                        recheck_pages += 1;
+                    }
+                }
+                pg_sys::tbm_end_iterate(iter);
+            }
+
+            pgrx::notice!(
+                "[bitmap_harvest] TIDBitmap: {pages} pages ({exact_tuples} exact tuples, \
+                 {lossy_pages} lossy pages, {recheck_pages} recheck pages)"
+            );
+            pg_sys::tbm_free(tbm);
+        }
     }
 }

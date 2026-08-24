@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use crate::api::{FieldName, HashMap, OrderByInfo, Varno};
 use crate::customscan::CustomScanState;
 use crate::index::reader::index::SearchIndexReader;
+use crate::postgres::customscan::basescan::bitmap_harvest::BitmapExec;
 use crate::postgres::customscan::basescan::cost::WorkerDecisionReason;
 use crate::postgres::customscan::basescan::exec_methods::ExecMethod;
 use crate::postgres::customscan::basescan::parallel::{ParallelRole, ParallelScanHandle};
@@ -106,10 +107,9 @@ pub struct BaseScanState {
     pub exec_method_type: ExecMethodType,
     pub ambulkdelete_epoch: u32,
 
-    /// Initialized child BitmapIndexScan/BitmapAnd PlanState, if a bitmap
-    /// intersection source was harvested at plan time.
-    pub bitmap_child_state: Option<*mut pg_sys::PlanState>,
-    pub bitmap_consumed: bool,
+    /// Execution state for the child bitmap scan, if a bitmap intersection source was
+    /// harvested at plan time.
+    pub bitmap_exec: Option<BitmapExec>,
 
     pub doc_from_heap_state: Option<HeapFetchState>,
 

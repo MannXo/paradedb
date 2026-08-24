@@ -753,7 +753,7 @@ impl CustomScan for BaseScan {
                 return None;
             }
 
-            let harvested_bitmap_path = bitmap_harvest::BitmapHarvester::from_query(
+            let harvested_bitmap_path = bitmap_harvest::BitmapPlanner::from_query(
                 root,
                 builder.args().rel,
                 bm25_index.oid(),
@@ -1626,13 +1626,11 @@ impl CustomScan for BaseScan {
             // Initialize the harvested child bitmap scan, if any; registering it in
             // custom_ps lets EXPLAIN render it.
             let cscan = state.csstate.ss.ps.plan.cast::<pg_sys::CustomScan>();
-            let custom_plans = PgList::<pg_sys::Plan>::from_pg((*cscan).custom_plans);
-            if let Some(child_plan) = custom_plans.get_ptr(0) {
-                let child_state = pg_sys::ExecInitNode(child_plan, estate, eflags);
+            if let Some(bitmap_exec) = bitmap_harvest::BitmapExec::init(cscan, estate, eflags) {
                 let mut custom_ps = PgList::<pg_sys::PlanState>::from_pg(state.csstate.custom_ps);
-                custom_ps.push(child_state);
+                custom_ps.push(bitmap_exec.planstate());
                 state.csstate.custom_ps = custom_ps.into_pg();
-                state.custom_state_mut().bitmap_child_state = Some(child_state);
+                state.custom_state_mut().bitmap_exec = Some(bitmap_exec);
             }
 
             // setup the structures we need to do mvcc checking and heap fetching
@@ -1693,11 +1691,8 @@ impl CustomScan for BaseScan {
             Self::init_search_reader(state);
         }
 
-        if !state.custom_state().bitmap_consumed
-            && let Some(child) = state.custom_state().bitmap_child_state
-        {
-            state.custom_state_mut().bitmap_consumed = true;
-            unsafe { bitmap_harvest::consume_and_report(child) };
+        if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
+            unsafe { bitmap_exec.consume_and_report() };
         }
 
         loop {
@@ -1847,8 +1842,8 @@ impl CustomScan for BaseScan {
 
         // get some things dropped now
         // Core's ExecEndCustomScan does not end custom_ps children for us.
-        if let Some(child) = state.custom_state_mut().bitmap_child_state.take() {
-            unsafe { pg_sys::ExecEndNode(child) };
+        if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.take() {
+            unsafe { bitmap_exec.shutdown() };
         }
 
         drop(state.custom_state_mut().visibility_checker.take());
