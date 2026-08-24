@@ -1121,6 +1121,7 @@ impl AggregateScan {
             query: vec![],
             with_aggregates: false,
             with_segment_info: false,
+            vector: None,
         };
 
         crate::postgres::customscan::mpp::launch::launch_mpp_aggregate(physical, args)

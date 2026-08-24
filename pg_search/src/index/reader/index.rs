@@ -43,7 +43,6 @@ use crate::scan::info::RowEstimate;
 use crate::schema::{SearchFieldType, SearchIndexSchema};
 
 use crate::index::reader::vector::VectorSearchWorker;
-use crate::postgres::customscan::basescan::vector_work::VectorClaim;
 use anyhow::Result;
 use tantivy::aggregation::DistributedAggregationCollector;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
@@ -941,7 +940,7 @@ impl SearchIndexReader {
         offset: usize,
         aux_collector: Option<TopKAuxiliaryCollector>,
         parallel_state_holding_shared_threshold: Option<*mut crate::postgres::ParallelScanState>,
-        vector_claims: Option<&mut (dyn FnMut() -> Option<VectorClaim> + '_)>,
+        vector_parallel: Option<crate::index::reader::vector::VectorParallelRun<'_>>,
     ) -> TopKSearch {
         let (first_orderby_info, erased_features) = self.prepare_features(orderby_info);
         match first_orderby_info {
@@ -1150,8 +1149,8 @@ impl SearchIndexReader {
                 let tie_break_count = tie_breaks.len();
                 let mut tie_breaks = tie_breaks.into_iter();
                 let mut next = || tie_breaks.next().expect("tie-break feature should exist");
-                let run = VectorSearchWorker::new(&self.searcher, &self.query);
-                let claims = vector_claims;
+                let run = VectorSearchWorker::new(&self.searcher, &self.query, tantivy_field);
+                let claims = vector_parallel;
                 let fruit = match tie_break_count {
                     0 => run.run(collector, claims),
                     1 => run.run(collector.with_tie_break(next()), claims),

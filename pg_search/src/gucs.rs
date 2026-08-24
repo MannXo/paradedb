@@ -225,6 +225,14 @@ static TERM_SET_BITSET_MAX_DENSITY_MULTI: GucSetting<f64> = GucSetting::<f64>::n
 /// recall@1 within ~1% of clusters). `1.0` probes every cluster.
 static VECTOR_CLUSTER_MAX_PROBE: GucSetting<f64> = GucSetting::<f64>::new(0.02);
 
+/// Clustered rows below which a vector scan is not worth splitting
+/// across parallel workers (Gather setup costs ~ms).
+static VECTOR_PARALLEL_MIN_ROWS: GucSetting<i32> = GucSetting::<i32>::new(250_000);
+
+pub fn vector_parallel_min_rows() -> usize {
+    VECTOR_PARALLEL_MIN_ROWS.get().max(0) as usize
+}
+
 pub fn vector_cluster_max_probe() -> f32 {
     VECTOR_CLUSTER_MAX_PROBE.get() as f32
 }
@@ -377,6 +385,17 @@ pub fn init() {
         &EXPENSIVE_QUERY_COST_FACTOR,
         0.0,
         100000.0,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"paradedb.vector_parallel_min_rows",
+        c"Minimum clustered vector rows before a vector scan parallelizes",
+        c"Below this many rows in the clustered tier, the Gather's setup cost outweighs splitting the scan",
+        &VECTOR_PARALLEL_MIN_ROWS,
+        0,
+        i32::MAX,
         GucContext::Userset,
         GucFlags::default(),
     );

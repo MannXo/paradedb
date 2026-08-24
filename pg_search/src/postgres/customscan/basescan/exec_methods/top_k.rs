@@ -27,13 +27,13 @@ use crate::index::fast_fields_helper::{FFType, resolve_ctid};
 use crate::index::reader::index::{
     MAX_TOPK_FEATURES, SearchIndexReader, TopKAuxiliaryCollector, TopKSearch, TopKSearchResults,
 };
+use crate::index::reader::vector::{VectorParallelRun, VectorUnit};
 use crate::postgres::ParallelScanState;
 use crate::postgres::customscan::aggregatescan::exec::AggregationResults;
 use crate::postgres::customscan::aggregatescan::{AggIndexInfo, AggregateType};
 use crate::postgres::customscan::basescan::exec_methods::{ExecMethod, ExecState};
 use crate::postgres::customscan::basescan::projections::window_agg::WindowAggregateInfo;
 use crate::postgres::customscan::basescan::scan_state::BaseScanState;
-use crate::postgres::customscan::basescan::vector_work::{VectorClaim, VectorScanWork};
 use crate::postgres::customscan::builders::custom_path::ExecMethodType;
 use crate::postgres::customscan::limit_offset::LimitOffset;
 use crate::postgres::customscan::parallel::checkout_segment_for_source;
@@ -80,7 +80,7 @@ pub struct TopKScanExecState {
     claimed_segments: RefCell<Option<Vec<SegmentId>>>,
     // If a parallel vector scan, the claimed units of work — each maps
     // 1:1 onto a collect_ivf / collect_flat call in the search.
-    vector_claims: RefCell<Option<Vec<VectorClaim>>>,
+    vector_units: RefCell<Option<Vec<VectorUnit>>>,
     scale_factor: f64,
     // Window aggregates to compute
     window_aggregates: Vec<WindowAggregateInfo>,
@@ -133,7 +133,7 @@ impl TopKScanExecState {
             offset: 0,
             chunk_size: 0,
             claimed_segments: RefCell::default(),
-            vector_claims: RefCell::default(),
+            vector_units: RefCell::default(),
             scale_factor,
             window_aggregates: Vec::new(),
             ctid_cache: None,
@@ -201,17 +201,14 @@ impl TopKScanExecState {
         }
     }
 
-    /// For a parallel VECTOR scan: a claim SOURCE the search pulls units
-    /// from ONE AT A TIME — the search claims the next unit only after
-    /// finishing the previous one's work, which is what load-balances the
-    /// units across participants (a one-shot drain would let the leader,
-    /// which starts first, take everything). Each unit is recorded so
-    /// re-queries replay the same claims instead of re-claiming. `None`
-    /// for serial or non-vector scans.
-    fn vector_claim_source(
+    /// For a parallel VECTOR scan: whether this participant runs the
+    /// leader-routed protocol, plus any units recorded by this scan's
+    /// first pass (a re-query replays them instead of re-claiming).
+    /// `None` for serial or non-vector scans.
+    fn vector_parallel_pieces(
         &self,
         parallel_state: Option<*mut ParallelScanState>,
-    ) -> Option<Box<dyn FnMut() -> Option<VectorClaim> + '_>> {
+    ) -> Option<(Option<Vec<VectorUnit>>, *mut ParallelScanState)> {
         let parallel_state = parallel_state?;
         let is_vector = self
             .orderby_info
@@ -221,28 +218,11 @@ impl TopKScanExecState {
         if !is_vector {
             return None;
         }
-        if let Some(recorded) = self.vector_claims.borrow().clone() {
-            // Re-query (visibility re-check / bigger limit): replay.
-            let mut recorded = recorded.into_iter();
-            return Some(Box::new(move || recorded.next()));
+        let replay = self.vector_units.borrow().clone();
+        if replay.is_none() {
+            *self.vector_units.borrow_mut() = Some(Vec::new());
         }
-        *self.vector_claims.borrow_mut() = Some(Vec::new());
-        *self.claimed_segments.borrow_mut() = Some(Vec::new());
-        Some(Box::new(move || {
-            check_for_interrupts!();
-            let claim = unsafe { VectorScanWork::claim(parallel_state) }?;
-            self.vector_claims
-                .borrow_mut()
-                .as_mut()
-                .expect("recording initialized above")
-                .push(claim.clone());
-            self.claimed_segments
-                .borrow_mut()
-                .as_mut()
-                .expect("recording initialized above")
-                .extend(claim.segment_ids());
-            Some(claim)
-        }))
+        Some((replay, parallel_state))
     }
 
     fn prepare_aggregations(&self, state: &mut BaseScanState) -> Option<PreparedAggregations> {
@@ -453,7 +433,24 @@ impl ExecMethod for TopKScanExecState {
             // clustered chunk / single flat segments) from this source as
             // it goes; each unit becomes one collect_ivf / collect_flat
             // call.
-            let mut vector_claims = self.vector_claim_source(state.parallel_state());
+            let vector_pieces = self.vector_parallel_pieces(state.parallel_state());
+            let mut record_unit = |unit: VectorUnit| {
+                if let VectorUnit::Flat(id) = unit
+                    && let Some(segments) = self.claimed_segments.borrow_mut().as_mut()
+                {
+                    segments.push(id);
+                }
+                self.vector_units
+                    .borrow_mut()
+                    .get_or_insert_with(Vec::new)
+                    .push(unit);
+            };
+            let vector_parallel = vector_pieces.map(|(replay, pstate)| VectorParallelRun {
+                pstate,
+                leader: unsafe { pgrx::pg_sys::ParallelWorkerNumber } == -1,
+                replay,
+                record: &mut record_unit,
+            });
             let TopKSearch {
                 results,
                 segment_info,
@@ -472,7 +469,7 @@ impl ExecMethod for TopKScanExecState {
                     self.offset,
                     maybe_aux_collector,
                     maybe_parallel_state,
-                    vector_claims.as_deref_mut(),
+                    vector_parallel,
                 );
             // Per-segment Fruit JSON → local ScanTelemetry. Workers publish into
             // DSM once at EndCustomScan; the leader merges at Shutdown.
@@ -624,7 +621,7 @@ impl ExecMethod for TopKScanExecState {
     fn reset(&mut self, state: &mut BaseScanState) {
         // Reset state
         self.claimed_segments.take();
-        self.vector_claims.take();
+        self.vector_units.take();
         self.did_query = false;
         self.exhausted = false;
         self.search_query_input = Some(state.search_query_input().clone());

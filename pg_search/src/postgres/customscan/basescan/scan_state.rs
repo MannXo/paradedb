@@ -240,9 +240,14 @@ impl BaseScanState {
             None => vec![search_reader.segment_view()],
         };
 
+        let vector = self
+            .vector_work
+            .as_ref()
+            .and_then(|work| work.vector_scan_args());
         ParallelScanArgs {
             all_sources,
             query,
+            vector,
             with_aggregates,
             with_segment_info: true,
         }

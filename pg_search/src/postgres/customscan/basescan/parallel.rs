@@ -113,6 +113,7 @@ impl ParallelQueryCapable for BaseScan {
             &args.query,
             args.with_aggregates,
             args.with_segment_info,
+            args.vector.map(|v| v.layout),
         )
     }
 

@@ -215,6 +215,20 @@ struct AggregatesPayloadHeader {
     serialized_aggregations_len: usize,
 }
 
+/// Sizing for a leader-routed vector scan's payload regions; `None` for
+/// every non-vector scan.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VectorScanLayoutSpec {
+    /// Ring slots — one per centroid is the hard upper bound on
+    /// enqueueable clusters.
+    pub ring_capacity: u32,
+    /// Clustered segments with a shared-filter slot.
+    pub n_filter_segments: u32,
+    /// Bytes per filter slot (uniform: the largest segment's serialized
+    /// dense bitset).
+    pub filter_slot_bytes: u32,
+}
+
 #[derive(Debug)]
 #[repr(C)]
 struct ParallelScanPayloadLayout {
@@ -248,6 +262,16 @@ struct ParallelScanPayloadLayout {
     segment_info_data: Range<usize>,
     aggregates_header: Option<Range<usize>>,
     aggregates_data: Option<Range<usize>>,
+    /// Leader-routed vector scan: the ranked-cluster ring — `(u32 cluster,
+    /// f32 routing score)` pairs, appended by the leader, claimed by
+    /// cursor. Empty for non-vector scans.
+    vector_ring: Range<usize>,
+    /// Two `u32`s per clustered segment: shared-filter build state
+    /// (`VECTOR_FILTER_*`) and serialized bitset length.
+    vector_filter_states: Range<usize>,
+    /// The shared filter slots, `vector_filter_slot` bytes each.
+    vector_filter_data: Range<usize>,
+    vector_filter_slot: usize,
     /// The padded size of the layout.
     total: Layout,
 }
@@ -258,6 +282,7 @@ impl ParallelScanPayloadLayout {
         serialized_query: &[u8],
         with_aggregates: bool,
         with_segment_info: bool,
+        vector: Option<VectorScanLayoutSpec>,
     ) -> Result<Self, std::alloc::LayoutError> {
         let n_sources = all_nsegments.len();
         let total_segs: usize = all_nsegments.iter().sum();
@@ -337,6 +362,26 @@ impl ParallelScanPayloadLayout {
             (None, None)
         };
 
+        let spec = vector.unwrap_or_default();
+        let ring_layout = Layout::from_size_align(spec.ring_capacity as usize * 8, 8)?;
+        let (l, ring_offset) = layout.extend(ring_layout)?;
+        layout = l;
+        let vector_ring = ring_offset..(ring_offset + ring_layout.size());
+
+        let states_layout = Layout::array::<u32>(spec.n_filter_segments as usize * 2)?;
+        let (l, states_offset) = layout.extend(states_layout)?;
+        layout = l;
+        let vector_filter_states = states_offset..(states_offset + states_layout.size());
+
+        let filter_data_layout = Layout::from_size_align(
+            spec.n_filter_segments as usize * spec.filter_slot_bytes as usize,
+            8,
+        )?;
+        let (l, filter_data_offset) = layout.extend(filter_data_layout)?;
+        layout = l;
+        let vector_filter_data =
+            filter_data_offset..(filter_data_offset + filter_data_layout.size());
+
         Ok(Self {
             query: query_range,
             all_counts: all_counts_range,
@@ -350,6 +395,10 @@ impl ParallelScanPayloadLayout {
             segment_info_data,
             aggregates_header,
             aggregates_data,
+            vector_ring,
+            vector_filter_states,
+            vector_filter_data,
+            vector_filter_slot: spec.filter_slot_bytes as usize,
             // Finalize the layout by padding it to its overall alignment.
             total: layout.pad_to_align(),
         })
@@ -374,6 +423,7 @@ impl ParallelScanPayload {
         query: &[u8],
         with_aggregates: bool,
         with_segment_info: bool,
+        vector: Option<VectorScanLayoutSpec>,
     ) {
         let all_nsegments: Vec<usize> = all_sources.iter().map(|s| s.len()).collect();
         // Compute and assign the execution-time layout from actual segment counts.
@@ -382,6 +432,7 @@ impl ParallelScanPayload {
             query,
             with_aggregates,
             with_segment_info,
+            vector,
         )
         .expect("could not layout `ParallelScanPayload` for initialization");
 
@@ -621,6 +672,78 @@ impl ParallelScanPayload {
         }
     }
 
+    fn vector_ring(&self) -> &[u64] {
+        let range = self.layout.vector_ring.clone();
+        let bytes = &self.data()[range];
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u64>(), bytes.len() / 8) }
+    }
+
+    fn vector_ring_mut(&mut self) -> &mut [u64] {
+        let range = self.layout.vector_ring.clone();
+        let bytes = &mut self.data_mut()[range];
+        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u64>(), bytes.len() / 8) }
+    }
+
+    fn vector_filter_states_mut(&mut self) -> &mut [u32] {
+        let range = self.layout.vector_filter_states.clone();
+        let bytes = &mut self.data_mut()[range];
+        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u32>(), bytes.len() / 4) }
+    }
+
+    /// Segment `idx`'s state word, atomically shared across processes.
+    fn vector_filter_states_atomic(&self, idx: usize) -> &std::sync::atomic::AtomicU32 {
+        let range = self.layout.vector_filter_states.clone();
+        let bytes = &self.data()[range];
+        let words = bytes.len() / 4;
+        assert!(idx * 2 < words, "filter state index out of range");
+        unsafe {
+            &*bytes
+                .as_ptr()
+                .cast::<std::sync::atomic::AtomicU32>()
+                .add(idx * 2)
+        }
+    }
+
+    fn vector_filter_len(&self, idx: usize) -> u32 {
+        use std::sync::atomic::Ordering;
+        let range = self.layout.vector_filter_states.clone();
+        let bytes = &self.data()[range];
+        unsafe {
+            (*bytes
+                .as_ptr()
+                .cast::<std::sync::atomic::AtomicU32>()
+                .add(idx * 2 + 1))
+            .load(Ordering::Acquire)
+        }
+    }
+
+    fn set_vector_filter_len(&mut self, idx: usize, len: u32) {
+        use std::sync::atomic::Ordering;
+        let range = self.layout.vector_filter_states.clone();
+        let bytes = &self.data()[range];
+        unsafe {
+            (*bytes
+                .as_ptr()
+                .cast::<std::sync::atomic::AtomicU32>()
+                .add(idx * 2 + 1))
+            .store(len, Ordering::Release);
+        }
+    }
+
+    fn vector_filter_slot(&self, idx: usize) -> &[u8] {
+        let slot = self.layout.vector_filter_slot;
+        let range = self.layout.vector_filter_data.clone();
+        let bytes = &self.data()[range];
+        &bytes[idx * slot..(idx + 1) * slot]
+    }
+
+    fn vector_filter_slot_mut(&mut self, idx: usize) -> &mut [u8] {
+        let slot = self.layout.vector_filter_slot;
+        let range = self.layout.vector_filter_data.clone();
+        let bytes = &mut self.data_mut()[range];
+        &mut bytes[idx * slot..(idx + 1) * slot]
+    }
+
     fn aggregates_data(&self) -> Option<&[u8]> {
         let range = self.layout.aggregates_data.clone()?;
         Some(&self.data()[range])
@@ -638,6 +761,47 @@ pub struct ParallelScanArgs {
     /// ([`SEGMENT_INFO_MAX_PER_SEG`] bytes each). Only basescan's Top-K workers publish them;
     /// every other scan leaves them out so the DSM stays small.
     with_segment_info: bool,
+    /// The leader-routed vector scan's regions and query-wide budget;
+    /// `None` for every non-vector scan (see
+    /// `customscan::basescan::vector_work`).
+    vector: Option<VectorScanArgs>,
+}
+
+const VECTOR_FILTER_NOT_BUILT: u32 = 0;
+const VECTOR_FILTER_BUILDING: u32 = 1;
+const VECTOR_FILTER_EMPTY: u32 = 2;
+const VECTOR_FILTER_READY: u32 = 3;
+
+/// A shared-filter slot's build state (see `vector_filter_try_claim`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorFilterState {
+    NotBuilt,
+    /// This caller won the build claim and must publish.
+    Build,
+    Building,
+    Empty,
+    Ready,
+}
+
+/// One claim from the ranked-cluster ring.
+pub enum VectorRingClaim {
+    Batch {
+        start: u32,
+        entries: Vec<(u32, f32)>,
+    },
+    Wait,
+    Drained,
+}
+
+/// Everything the leader resolves once for a leader-routed vector scan:
+/// payload sizing plus the query-wide probe budget and global work model
+/// every participant prices against.
+#[derive(Clone, Copy, Debug)]
+pub struct VectorScanArgs {
+    pub layout: VectorScanLayoutSpec,
+    pub budget_millis: i64,
+    pub total_docs: u64,
+    pub total_nonempty_clusters: u64,
 }
 
 impl ParallelScanArgs {
@@ -696,6 +860,23 @@ pub struct ParallelScanState {
     queries_per_worker: [u16; WORKER_METRICS_MAX_COUNT],
     /// Top-K Shared Threshold Fields
     pub shared_threshold: ParallelScanThresholdState,
+    /// Leader-routed vector scan: work spent so far across every
+    /// participant, in milli-work-units, accumulated at collect-call
+    /// granularity. Zero for non-vector scans.
+    vector_spend_millis: std::sync::atomic::AtomicI64,
+    /// The query-wide probe budget the leader resolved; enqueueing stops
+    /// when spend plus the in-flight window reaches it.
+    vector_budget_millis: i64,
+    /// Global work-model totals (docs, non-empty postings) for pricing.
+    vector_model_docs: u64,
+    vector_model_nonempty: u64,
+    /// Ranked-cluster ring cursors: entries `[.. head)` are produced (the
+    /// leader is the only producer), `[.. tail)` claimed. `tail` may
+    /// overshoot `head` transiently; claims clamp against `head`.
+    vector_ring_head: std::sync::atomic::AtomicU32,
+    vector_ring_tail: std::sync::atomic::AtomicU32,
+    /// 1 once the leader has enqueued the stream's last cluster.
+    vector_routing_done: std::sync::atomic::AtomicU32,
 
     payload: ParallelScanPayload, // must be last field, b/c it allocates on the heap after this struct
 }
@@ -706,12 +887,14 @@ impl ParallelScanState {
         serialized_query: &[u8],
         with_aggregates: bool,
         with_segment_info: bool,
+        vector: Option<VectorScanLayoutSpec>,
     ) -> usize {
         ParallelScanPayloadLayout::new(
             all_nsegments,
             serialized_query,
             with_aggregates,
             with_segment_info,
+            vector,
         )
         .expect("could not compute DSM payload capacity")
         .total
@@ -723,6 +906,7 @@ impl ParallelScanState {
         serialized_query: &[u8],
         with_aggregates: bool,
         with_segment_info: bool,
+        vector: Option<VectorScanLayoutSpec>,
     ) -> usize {
         std::mem::size_of::<Self>()
             + Self::payload_capacity_of(
@@ -730,6 +914,7 @@ impl ParallelScanState {
                 serialized_query,
                 with_aggregates,
                 with_segment_info,
+                vector,
             )
     }
 
@@ -750,6 +935,7 @@ impl ParallelScanState {
             &args.query,
             args.with_aggregates,
             args.with_segment_info,
+            args.vector,
         );
     }
 
@@ -764,9 +950,29 @@ impl ParallelScanState {
         query: &[u8],
         with_aggregates: bool,
         with_segment_info: bool,
+        vector: Option<VectorScanArgs>,
     ) {
-        self.payload
-            .init(all_sources, query, with_aggregates, with_segment_info);
+        use std::sync::atomic::{AtomicI64, AtomicU32};
+        self.payload.init(
+            all_sources,
+            query,
+            with_aggregates,
+            with_segment_info,
+            vector.map(|v| v.layout),
+        );
+        let v = vector.unwrap_or(VectorScanArgs {
+            layout: VectorScanLayoutSpec::default(),
+            budget_millis: 0,
+            total_docs: 0,
+            total_nonempty_clusters: 0,
+        });
+        self.vector_spend_millis = AtomicI64::new(0);
+        self.vector_budget_millis = v.budget_millis;
+        self.vector_model_docs = v.total_docs;
+        self.vector_model_nonempty = v.total_nonempty_clusters;
+        self.vector_ring_head = AtomicU32::new(0);
+        self.vector_ring_tail = AtomicU32::new(0);
+        self.vector_routing_done = AtomicU32::new(0);
         self.queries_per_worker = [0; WORKER_METRICS_MAX_COUNT];
         self.shared_threshold.reset();
         let primary_count = all_sources.first().expect("primary source empty").len();
@@ -1067,6 +1273,188 @@ impl ParallelScanState {
             .collect()
     }
 
+    /// The query-wide vector budget (milli work units); zero for
+    /// non-vector scans.
+    pub fn vector_budget_millis(&self) -> i64 {
+        self.vector_budget_millis
+    }
+
+    /// Global work-model totals, `None` when the scan carries no vector
+    /// budget.
+    pub fn vector_model(&self) -> Option<(u64, u64)> {
+        (self.vector_model_docs > 0).then_some((self.vector_model_docs, self.vector_model_nonempty))
+    }
+
+    /// Accumulates `millis` of probe spend; returns the query-wide total
+    /// after.
+    pub fn vector_charge_spend(&self, millis: i64) -> i64 {
+        use std::sync::atomic::Ordering;
+        self.vector_spend_millis
+            .fetch_add(millis, Ordering::Relaxed)
+            + millis
+    }
+
+    pub fn vector_spend_millis(&self) -> i64 {
+        use std::sync::atomic::Ordering;
+        self.vector_spend_millis.load(Ordering::Relaxed)
+    }
+
+    /// LEADER ONLY (single producer): appends ranked clusters to the ring
+    /// and publishes them with a release store.
+    pub fn vector_ring_push(&mut self, entries: &[(u32, f32)]) {
+        use std::sync::atomic::Ordering;
+        let head = self.vector_ring_head.load(Ordering::Relaxed) as usize;
+        let ring = self.payload.vector_ring_mut();
+        for (i, &(cluster, sim)) in entries.iter().enumerate() {
+            let slot = head + i;
+            assert!(slot < ring.len(), "vector ring overflow");
+            ring[slot] = ((cluster as u64) << 32) | (sim.to_bits() as u64);
+        }
+        self.vector_ring_head
+            .store((head + entries.len()) as u32, Ordering::Release);
+    }
+
+    /// Entries produced so far (the ring's publish cursor).
+    pub fn vector_ring_head(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.vector_ring_head.load(Ordering::Acquire)
+    }
+
+    /// Entries claimed so far. `tail` may transiently exceed `head`
+    /// (reservations clamp on read).
+    pub fn vector_ring_tail(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.vector_ring_tail.load(Ordering::Relaxed)
+    }
+
+    pub fn vector_routing_done(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.vector_routing_done.load(Ordering::Acquire) != 0
+    }
+
+    pub fn vector_set_routing_done(&self) {
+        use std::sync::atomic::Ordering;
+        self.vector_routing_done.store(1, Ordering::Release);
+    }
+
+    /// One claim from the ranked-cluster ring: up to `max` entries.
+    /// `Batch` carries produced entries; `Wait` means the claim raced
+    /// ahead of the producer (retry after a pause); `Drained` means the
+    /// stream is complete and empty.
+    pub fn vector_ring_claim(&mut self, max: usize) -> VectorRingClaim {
+        use std::sync::atomic::Ordering;
+        let head = self.vector_ring_head.load(Ordering::Acquire) as usize;
+        let tail = self.vector_ring_tail.load(Ordering::Relaxed) as usize;
+        if tail >= head {
+            return if self.vector_routing_done() {
+                // Re-check head: the producer may have published between
+                // the head load and the flag load.
+                let head = self.vector_ring_head.load(Ordering::Acquire) as usize;
+                if tail >= head {
+                    VectorRingClaim::Drained
+                } else {
+                    VectorRingClaim::Wait
+                }
+            } else {
+                VectorRingClaim::Wait
+            };
+        }
+        let take = max.min(head - tail);
+        let claimed = self
+            .vector_ring_tail
+            .compare_exchange(
+                tail as u32,
+                (tail + take) as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        if !claimed {
+            return VectorRingClaim::Wait;
+        }
+        let ring = self.payload.vector_ring();
+        let entries = ring[tail..tail + take]
+            .iter()
+            .map(|&packed| ((packed >> 32) as u32, f32::from_bits(packed as u32)))
+            .collect();
+        VectorRingClaim::Batch {
+            start: tail as u32,
+            entries,
+        }
+    }
+
+    /// Reads previously produced ring entries (for re-query replay of a
+    /// recorded claim).
+    pub fn vector_ring_read(&self, start: u32, len: u32) -> Vec<(u32, f32)> {
+        let ring = self.payload.vector_ring();
+        ring[start as usize..(start + len) as usize]
+            .iter()
+            .map(|&packed| ((packed >> 32) as u32, f32::from_bits(packed as u32)))
+            .collect()
+    }
+
+    /// Tries to claim the shared-filter build for clustered segment
+    /// `idx`; the exclusive winner gets `Build`, others observe the
+    /// state.
+    pub fn vector_filter_try_claim(&mut self, idx: usize) -> VectorFilterState {
+        let states = self.payload.vector_filter_states_atomic(idx);
+        use std::sync::atomic::Ordering;
+        match states.compare_exchange(
+            VECTOR_FILTER_NOT_BUILT,
+            VECTOR_FILTER_BUILDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => VectorFilterState::Build,
+            Err(VECTOR_FILTER_BUILDING) => VectorFilterState::Building,
+            Err(VECTOR_FILTER_EMPTY) => VectorFilterState::Empty,
+            Err(_) => VectorFilterState::Ready,
+        }
+    }
+
+    /// Observes segment `idx`'s filter state without claiming.
+    pub fn vector_filter_state(&self, idx: usize) -> VectorFilterState {
+        use std::sync::atomic::Ordering;
+        match self
+            .payload
+            .vector_filter_states_atomic(idx)
+            .load(Ordering::Acquire)
+        {
+            VECTOR_FILTER_NOT_BUILT => VectorFilterState::NotBuilt,
+            VECTOR_FILTER_BUILDING => VectorFilterState::Building,
+            VECTOR_FILTER_EMPTY => VectorFilterState::Empty,
+            _ => VectorFilterState::Ready,
+        }
+    }
+
+    /// Publishes segment `idx`'s built filter (serialized dense bitset)
+    /// into its DSM slot; `None` publishes EMPTY (no doc matches).
+    pub fn vector_filter_publish(&mut self, idx: usize, bytes: Option<&[u8]>) {
+        use std::sync::atomic::Ordering;
+        match bytes {
+            None => {
+                self.payload
+                    .vector_filter_states_atomic(idx)
+                    .store(VECTOR_FILTER_EMPTY, Ordering::Release);
+            }
+            Some(bytes) => {
+                let slot = self.payload.vector_filter_slot_mut(idx);
+                assert!(bytes.len() <= slot.len(), "filter slot overflow");
+                slot[..bytes.len()].copy_from_slice(bytes);
+                self.payload.set_vector_filter_len(idx, bytes.len() as u32);
+                self.payload
+                    .vector_filter_states_atomic(idx)
+                    .store(VECTOR_FILTER_READY, Ordering::Release);
+            }
+        }
+    }
+
+    /// Segment `idx`'s published filter bytes (state must be READY).
+    pub fn vector_filter_bytes(&self, idx: usize) -> &[u8] {
+        let len = self.payload.vector_filter_len(idx) as usize;
+        &self.payload.vector_filter_slot(idx)[..len]
+    }
+
     /// The leader's segment view of the partitioning source.
     ///
     /// This method will wait (spin) until the leader has initialized the segment data.
@@ -1203,6 +1591,15 @@ impl ParallelScanState {
 
     /// Restore the per-source remaining counts for a rescan. Called by amparallelrescan.
     pub fn reset(&mut self) {
+        use std::sync::atomic::{AtomicI64, AtomicU32};
+        self.vector_spend_millis = AtomicI64::new(0);
+        self.vector_ring_head = AtomicU32::new(0);
+        self.vector_ring_tail = AtomicU32::new(0);
+        self.vector_routing_done = AtomicU32::new(0);
+        // The filter build states live in the payload; rescan rebuilds.
+        for word in self.payload.vector_filter_states_mut() {
+            *word = 0;
+        }
         // Rescan re-partitions the same way as the initial scan, so reset every source's
         // remaining count back to its initial value.
         let counts: Vec<u32> = self.payload.all_counts().to_vec();
