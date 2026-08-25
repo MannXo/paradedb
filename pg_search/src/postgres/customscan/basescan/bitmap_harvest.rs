@@ -43,10 +43,15 @@ use crate::query::heap_field_filter::TidBitmapSet;
 use pgrx::{PgList, pg_sys};
 use std::sync::Arc;
 
-/// Sizes of a built `TidBitmapSet`, surfaced in `EXPLAIN ANALYZE`.
 pub struct TidBitmapStats {
+    /// Row locations the bitmap knows precisely; misses among them are rejected
+    /// without heap access.
     pub exact_ctids: usize,
+    /// Heap blocks the TIDBitmap degraded under `work_mem` pressure: only "this block
+    /// has matches" survived, so nothing on them can be rejected and all filters run.
     pub lossy_blocks: usize,
+    /// Heap blocks whose exact candidates the index AM flagged as approximate matches
+    /// (e.g. GiST bounding boxes); their rows also run the recheck filters.
     pub recheck_blocks: usize,
 }
 
