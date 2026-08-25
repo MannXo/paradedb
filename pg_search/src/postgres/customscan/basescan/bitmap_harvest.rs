@@ -62,7 +62,7 @@ pub struct BitmapPlanner {
     heap_exprs: Vec<*mut pg_sys::Node>,
     /// Estimated rows the driving BM25 scan will emit, when the caller has one.
     /// Feeds the cost ledger; without it, harvest falls back to first-match.
-    bm25_rows: Option<f64>,
+    bm25_row_estimate: Option<f64>,
 }
 
 struct HarvestedClause {
@@ -130,7 +130,7 @@ impl BitmapPlanner {
         rel: *mut pg_sys::RelOptInfo,
         bm25_oid: pg_sys::Oid,
         quals: &Qual,
-        bm25_rows: Option<f64>,
+        bm25_row_estimate: Option<f64>,
     ) -> Option<Self> {
         fn collect(qual: &Qual, out: &mut Vec<*mut pg_sys::Node>) -> bool {
             match qual {
@@ -153,7 +153,7 @@ impl BitmapPlanner {
             rel,
             bm25_oid,
             heap_exprs,
-            bm25_rows,
+            bm25_row_estimate,
         })
     }
 
@@ -166,7 +166,7 @@ impl BitmapPlanner {
         rel: *mut pg_sys::RelOptInfo,
         bm25_oid: pg_sys::Oid,
         query: &SearchQueryInput,
-        bm25_rows: Option<f64>,
+        bm25_row_estimate: Option<f64>,
     ) -> Option<Self> {
         unsafe fn collect(sqi: &SearchQueryInput, out: &mut Vec<*mut pg_sys::Node>) -> bool {
             unsafe {
@@ -216,7 +216,7 @@ impl BitmapPlanner {
             rel,
             bm25_oid,
             heap_exprs,
-            bm25_rows,
+            bm25_row_estimate,
         })
     }
 
@@ -374,12 +374,12 @@ impl BitmapPlanner {
                     );
                     continue;
                 }
-                let Some(bm25_rows) = self.bm25_rows else {
+                let Some(bm25_row_estimate) = self.bm25_row_estimate else {
                     return Some((self.heap_path(ipath), self.bitmap_build_cost(ipath)));
                 };
-                let net = self.ledger(ipath, bm25_rows);
+                let net = self.ledger(ipath, bm25_row_estimate);
                 pgrx::debug1!(
-                    "[bitmap_harvest] index {index_name}: net={net:.2} (bm25_rows={bm25_rows:.0} selectivity={:.6} indextotalcost={:.2})",
+                    "[bitmap_harvest] index {index_name}: net={net:.2} (bm25_row_estimate={bm25_row_estimate:.0} selectivity={:.6} indextotalcost={:.2})",
                     (*ipath).indexselectivity,
                     (*ipath).indextotalcost,
                 );
@@ -409,7 +409,7 @@ impl BitmapPlanner {
     /// set. Uses the IndexPath's `indextotalcost`/`indexselectivity` rather than a
     /// BitmapHeapPath's costs, which `cost_bitmap_heap_scan` pollutes with the
     /// `@@@` qual's huge procost even though only the index child ever executes.
-    unsafe fn ledger(&self, ipath: *mut pg_sys::IndexPath, bm25_rows: f64) -> f64 {
+    unsafe fn ledger(&self, ipath: *mut pg_sys::IndexPath, bm25_row_estimate: f64) -> f64 {
         unsafe {
             let tuples = (*self.rel).tuples.max(1.0);
             let pages = (*self.rel).pages as f64;
@@ -427,7 +427,7 @@ impl BitmapPlanner {
 
             let per_row_saved =
                 cpu_tuple_cost + qual_cost.per_tuple + (pages / tuples) * random_page_cost;
-            let benefit = bm25_rows * (1.0 - sel) * per_row_saved;
+            let benefit = bm25_row_estimate * (1.0 - sel) * per_row_saved;
             benefit - self.bitmap_build_cost(ipath)
         }
     }

@@ -1375,14 +1375,14 @@ impl AggregateScan {
                     // `@@@` clauses), which would double-count what the bitmap saves.
                     // Use the same convention the base scan applies to
                     // heap-filter queries: reltuples scaled by the parameterized guess.
-                    let bm25_rows = (!base_rel.is_null() && (*base_rel).tuples > 0.0)
+                    let bm25_row_estimate = (!base_rel.is_null() && (*base_rel).tuples > 0.0)
                         .then(|| (*base_rel).tuples * PARAMETERIZED_SELECTIVITY);
                     if let Some(harvested) = BitmapPlanner::from_search_query(
                         root,
                         base_rel,
                         index.oid(),
                         aggregate_clause.query(),
-                        bm25_rows,
+                        bm25_row_estimate,
                     )
                     .and_then(|planner| planner.harvest())
                     {
