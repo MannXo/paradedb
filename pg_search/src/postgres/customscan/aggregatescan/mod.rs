@@ -997,7 +997,6 @@ impl CustomScan for AggregateScan {
     }
 
     fn end_custom_scan(state: &mut CustomScanStateWrapper<Self>) {
-        // Core's ExecEndCustomScan does not end custom_ps children for us.
         if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.take() {
             unsafe { bitmap_exec.shutdown() };
         }
@@ -1374,16 +1373,16 @@ impl AggregateScan {
                     };
                     // `base_rel.rows` already prices in the covered heap quals (and the
                     // `@@@` clauses), which would double-count what the bitmap saves.
-                    // Use the same drive convention the base scan applies to
+                    // Use the same convention the base scan applies to
                     // heap-filter queries: reltuples scaled by the parameterized guess.
-                    let drive_rows = (!base_rel.is_null() && (*base_rel).tuples > 0.0)
+                    let bm25_rows = (!base_rel.is_null() && (*base_rel).tuples > 0.0)
                         .then(|| (*base_rel).tuples * PARAMETERIZED_SELECTIVITY);
                     if let Some(harvested) = BitmapPlanner::from_search_query(
                         root,
                         base_rel,
                         index.oid(),
                         aggregate_clause.query(),
-                        drive_rows,
+                        bm25_rows,
                     )
                     .and_then(|planner| planner.harvest())
                     {

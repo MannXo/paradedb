@@ -940,7 +940,7 @@ impl CustomScan for BaseScan {
             }
             .max(1.0);
 
-            // Harvest a bitmap intersection source now that the drive-side row estimate
+            // Harvest a bitmap intersection source now that the BM25-side row estimate
             // exists to feed the cost ledger, and rewrite the covered HeapFilters.
             let harvested_bitmap = bitmap_harvest::BitmapPlanner::from_query(
                 root,
@@ -1878,7 +1878,6 @@ impl CustomScan for BaseScan {
         }
 
         // get some things dropped now
-        // Core's ExecEndCustomScan does not end custom_ps children for us.
         if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.take() {
             unsafe { bitmap_exec.shutdown() };
         }

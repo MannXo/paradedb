@@ -62,7 +62,7 @@ pub struct BitmapPlanner {
     heap_exprs: Vec<*mut pg_sys::Node>,
     /// Estimated rows the driving BM25 scan will emit, when the caller has one.
     /// Feeds the cost ledger; without it, harvest falls back to first-match.
-    drive_rows: Option<f64>,
+    bm25_rows: Option<f64>,
 }
 
 struct HarvestedClause {
@@ -130,7 +130,7 @@ impl BitmapPlanner {
         rel: *mut pg_sys::RelOptInfo,
         bm25_oid: pg_sys::Oid,
         quals: &Qual,
-        drive_rows: Option<f64>,
+        bm25_rows: Option<f64>,
     ) -> Option<Self> {
         fn collect(qual: &Qual, out: &mut Vec<*mut pg_sys::Node>) -> bool {
             match qual {
@@ -153,7 +153,7 @@ impl BitmapPlanner {
             rel,
             bm25_oid,
             heap_exprs,
-            drive_rows,
+            bm25_rows,
         })
     }
 
@@ -166,7 +166,7 @@ impl BitmapPlanner {
         rel: *mut pg_sys::RelOptInfo,
         bm25_oid: pg_sys::Oid,
         query: &SearchQueryInput,
-        drive_rows: Option<f64>,
+        bm25_rows: Option<f64>,
     ) -> Option<Self> {
         unsafe fn collect(sqi: &SearchQueryInput, out: &mut Vec<*mut pg_sys::Node>) -> bool {
             unsafe {
@@ -216,7 +216,7 @@ impl BitmapPlanner {
             rel,
             bm25_oid,
             heap_exprs,
-            drive_rows,
+            bm25_rows,
         })
     }
 
@@ -321,7 +321,7 @@ impl BitmapPlanner {
     /// Build a `BitmapHeapPath` over the non-BM25 index whose bitmap is worth
     /// intersecting: every index with a key column matching a HeapExpr clause is
     /// scored by [`Self::ledger`] and the best positive-net one wins. Without a
-    /// drive-side row estimate the first workable index is taken unscored.
+    /// BM25-side row estimate the first workable index is taken unscored.
     ///
     /// TODO: combine several positive-net indexes with `create_bitmap_and_path`
     /// instead of keeping only the best — greedily, in descending net order, while
@@ -374,12 +374,12 @@ impl BitmapPlanner {
                     );
                     continue;
                 }
-                let Some(drive_rows) = self.drive_rows else {
+                let Some(bm25_rows) = self.bm25_rows else {
                     return Some((self.heap_path(ipath), self.bitmap_build_cost(ipath)));
                 };
-                let net = self.ledger(ipath, drive_rows);
+                let net = self.ledger(ipath, bm25_rows);
                 pgrx::debug1!(
-                    "[bitmap_harvest] index {index_name}: net={net:.2} (drive_rows={drive_rows:.0} selectivity={:.6} indextotalcost={:.2})",
+                    "[bitmap_harvest] index {index_name}: net={net:.2} (bm25_rows={bm25_rows:.0} selectivity={:.6} indextotalcost={:.2})",
                     (*ipath).indexselectivity,
                     (*ipath).indextotalcost,
                 );
@@ -403,13 +403,13 @@ impl BitmapPlanner {
     }
 
     /// Net benefit of probing this index's bitmap ahead of the heap filters.
-    /// Benefit: each drive-side row the bitmap rejects (the non-selected fraction)
+    /// Benefit: each BM25-emitted row the bitmap rejects (the non-selected fraction)
     /// skips its heap fetch and all heap filter evaluation. Cost: building the
     /// bitmap (`indextotalcost`) plus converting its entries into the probe-able
     /// set. Uses the IndexPath's `indextotalcost`/`indexselectivity` rather than a
     /// BitmapHeapPath's costs, which `cost_bitmap_heap_scan` pollutes with the
     /// `@@@` qual's huge procost even though only the index child ever executes.
-    unsafe fn ledger(&self, ipath: *mut pg_sys::IndexPath, drive_rows: f64) -> f64 {
+    unsafe fn ledger(&self, ipath: *mut pg_sys::IndexPath, bm25_rows: f64) -> f64 {
         unsafe {
             let tuples = (*self.rel).tuples.max(1.0);
             let pages = (*self.rel).pages as f64;
@@ -427,7 +427,7 @@ impl BitmapPlanner {
 
             let per_row_saved =
                 cpu_tuple_cost + qual_cost.per_tuple + (pages / tuples) * random_page_cost;
-            let benefit = drive_rows * (1.0 - sel) * per_row_saved;
+            let benefit = bm25_rows * (1.0 - sel) * per_row_saved;
             benefit - self.bitmap_build_cost(ipath)
         }
     }
