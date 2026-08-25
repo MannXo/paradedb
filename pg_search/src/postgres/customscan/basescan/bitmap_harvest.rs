@@ -322,6 +322,13 @@ impl BitmapPlanner {
     /// intersecting: every index with a key column matching a HeapExpr clause is
     /// scored by [`Self::ledger`] and the best positive-net one wins. Without a
     /// drive-side row estimate the first workable index is taken unscored.
+    ///
+    /// TODO: combine several positive-net indexes with `create_bitmap_and_path`
+    /// instead of keeping only the best — greedily, in descending net order, while
+    /// each addition's *incremental* net stays positive (a later bitmap only
+    /// rejects rows the earlier ones kept, so its benefit shrinks by their
+    /// combined selectivity while its build cost stays full price). [`Self::accept`]
+    /// and the executor already handle a `BitmapAnd` child.
     unsafe fn build_bitmap_path(&self) -> Option<(*mut pg_sys::BitmapHeapPath, f64)> {
         unsafe {
             let mut best: Option<(*mut pg_sys::IndexPath, f64)> = None;
