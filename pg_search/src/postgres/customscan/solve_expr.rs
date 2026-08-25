@@ -39,7 +39,7 @@ impl SearchQueryInput {
     }
 
     /// Attach the execution-time candidate set to every HeapFilter that was flagged at
-    /// plan time as covered by an external index's bitmap (#5702).
+    /// plan time as covered by an external index's bitmap.
     pub fn attach_tid_candidate_set(&mut self, set: &Arc<TidCandidateSet>) {
         self.visit(&mut |sqi| {
             if let SearchQueryInput::HeapFilter {

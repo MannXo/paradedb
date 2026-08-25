@@ -697,7 +697,7 @@ pub struct ParallelScanState {
     /// Top-K Shared Threshold Fields
     pub shared_threshold: ParallelScanThresholdState,
 
-    /// Bitmap-intersection build coordination (#5702): 0 = not built, 1 = building,
+    /// Bitmap-intersection build coordination: 0 = not built, 1 = building,
     /// 2 = done. Protected by `mutex`; waiters sleep on `bitmap_cv`.
     bitmap_build_state: u32,
     /// DSA pointer to the published flat `TidCandidateSet` bytes; 0 when the build

@@ -1,4 +1,4 @@
--- Bitmap intersection (#5702): custom scans intersect with other indexes via a
+-- Bitmap intersection: custom scans intersect with other indexes via a
 -- BitmapIndexScan child whose TIDBitmap is probed inside the heap filter.
 --
 -- The table and queries mirror the originating customer workload: a provider search

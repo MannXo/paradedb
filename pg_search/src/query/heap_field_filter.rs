@@ -288,7 +288,7 @@ unsafe extern "C-unwind" fn param_resolver_mutator(
 }
 
 /// Row locations produced by an external index's `BitmapIndexScan`, converted into a
-/// probe-able form (#5702). `exact_ctids` uses the same `(block << 16) | offset`
+/// probe-able form. `exact_ctids` uses the same `(block << 16) | offset`
 /// packing as `item_pointer_to_u64`.
 ///
 /// The two block lists record different kinds of information loss, with different

@@ -17,7 +17,7 @@
 
 //! Finds a `BitmapHeapPath` over a non-BM25 index (btree, GIN, PostGIS GiST) whose
 //! bitmapqual covers quals we would otherwise evaluate as a `heap_filter`, so the
-//! index's TIDBitmap can be intersected with the Tantivy result set (#5702).
+//! index's TIDBitmap can be intersected with the Tantivy result set.
 //!
 //! Plan time: `BitmapPlanner::from_query` gathers the coverable HeapExpr quals and
 //! `harvest` finds or builds a covering `BitmapHeapPath`, which the caller attaches as

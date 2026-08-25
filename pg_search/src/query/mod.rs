@@ -148,7 +148,7 @@ pub enum SearchQueryInput {
         /// external index exactly (`IndexClause.lossy == false`), so a document found
         /// in the bitmap on an exact, non-recheck page already satisfies them.
         /// Evaluated only when that proof breaks down: a lossy page, a recheck-flagged
-        /// page, or no candidate set attached (#5702).
+        /// page, or no candidate set attached.
         #[serde(default)]
         #[serde(skip_serializing_if = "Vec::is_empty")]
         recheck_filters: Vec<HeapFieldFilter>,
