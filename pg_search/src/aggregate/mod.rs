@@ -113,10 +113,7 @@ struct ParallelAggregation {
     config: Config,
     query_bytes: Vec<u8>,
     agg_req_bytes: Vec<u8>,
-    /// postcard of `Option<TidCandidateSet>`: the query's serde skips the attached
-    /// candidate set (it must not bloat stored plans), so it ships to the workers
-    /// separately, in a compact binary form.
-    candidate_set_bytes: Vec<u8>,
+    tid_bitmap_bytes: Vec<u8>,
     segment_ids: Vec<(SegmentId, NumDeletedDocs)>,
     ambulkdelete_epoch: u32,
 }
@@ -134,7 +131,7 @@ impl ParallelProcess for ParallelAggregation {
             &self.query_bytes,
             &self.segment_ids,
             &self.ambulkdelete_epoch,
-            &self.candidate_set_bytes,
+            &self.tid_bitmap_bytes,
         ]
     }
 }
@@ -166,7 +163,7 @@ impl ParallelAggregation {
             },
             agg_req_bytes: serde_json::to_vec(&aggregation)?,
             query_bytes: serde_json::to_vec(query)?,
-            candidate_set_bytes: postcard::to_allocvec(&query.tid_candidate_set().as_deref())?,
+            tid_bitmap_bytes: postcard::to_allocvec(&query.tid_candidate_set().as_deref())?,
             segment_ids,
             ambulkdelete_epoch,
         })
@@ -344,18 +341,18 @@ impl ParallelWorker for ParallelAggregationWorker<'_> {
             .expect("wrong type for ambulkdelete_epoch")
             .expect("missing ambulkdelete_epoch value");
 
-        let candidate_set_bytes = state_manager
+        let tid_bitmap_bytes = state_manager
             .slice::<u8>(6)
-            .expect("wrong type for candidate_set_bytes")
-            .expect("missing candidate_set_bytes value");
+            .expect("wrong type for tid_bitmap_bytes")
+            .expect("missing tid_bitmap_bytes value");
 
         let aggregation = serde_json::from_slice::<AggregateRequest>(agg_req_bytes)
             .expect("agg_req_bytes should deserialize into an Aggregations");
         let mut query = serde_json::from_slice::<SearchQueryInput>(query_bytes)
             .expect("query_bytes should deserialize into an SearchQueryInput");
         // The query's serde skips any attached candidate set; reattach it.
-        if let Some(set) = postcard::from_bytes::<Option<TidCandidateSet>>(candidate_set_bytes)
-            .expect("candidate_set_bytes should deserialize into an Option<TidCandidateSet>")
+        if let Some(set) = postcard::from_bytes::<Option<TidCandidateSet>>(tid_bitmap_bytes)
+            .expect("tid_bitmap_bytes should deserialize into an Option<TidCandidateSet>")
         {
             query.attach_tid_candidate_set(&std::sync::Arc::new(set));
         }
