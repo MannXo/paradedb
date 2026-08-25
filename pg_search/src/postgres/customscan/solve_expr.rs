@@ -16,18 +16,18 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use crate::api::operator::searchqueryinput_typoid;
-use crate::query::heap_field_filter::TidCandidateSet;
+use crate::query::heap_field_filter::TidBitmapSet;
 use crate::query::{PostgresExpression, SearchQueryInput};
 use pgrx::{PgMemoryContexts, pg_sys};
 use std::sync::Arc;
 
 impl SearchQueryInput {
-    /// The candidate set attached to this query's HeapFilters, if any.
-    pub fn tid_candidate_set(&self) -> Option<Arc<TidCandidateSet>> {
+    /// The bitmap set attached to this query's HeapFilters, if any.
+    pub fn tid_bitmap_set(&self) -> Option<Arc<TidBitmapSet>> {
         let mut found = None;
         self.visit_ref(&mut |sqi| {
             if let SearchQueryInput::HeapFilter {
-                candidate_set: Some(set),
+                tid_bitmap_set: Some(set),
                 ..
             } = sqi
                 && found.is_none()
@@ -38,17 +38,17 @@ impl SearchQueryInput {
         found
     }
 
-    /// Attach the execution-time candidate set to every HeapFilter that was flagged at
+    /// Attach the execution-time bitmap set to every HeapFilter that was flagged at
     /// plan time as covered by an external index's bitmap.
-    pub fn attach_tid_candidate_set(&mut self, set: &Arc<TidCandidateSet>) {
+    pub fn attach_tid_bitmap_set(&mut self, set: &Arc<TidBitmapSet>) {
         self.visit(&mut |sqi| {
             if let SearchQueryInput::HeapFilter {
                 uses_tid_bitmap: true,
-                candidate_set,
+                tid_bitmap_set,
                 ..
             } = sqi
             {
-                *candidate_set = Some(Arc::clone(set));
+                *tid_bitmap_set = Some(Arc::clone(set));
             }
         });
     }

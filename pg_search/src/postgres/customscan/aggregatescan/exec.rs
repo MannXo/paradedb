@@ -65,17 +65,17 @@ pub fn aggregation_results_iter(
         .custom_state_mut()
         .prepare_query_for_execution(planstate, expr_context);
 
-    // Build (or reuse) the external index's candidate set and attach it to the
+    // Build (or reuse) the external index's bitmap set and attach it to the
     // query's HeapFilters. Parallel aggregate workers receive it through the
     // ParallelAggregation payload.
     if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
-        let set = unsafe { bitmap_exec.candidate_set() };
+        let set = unsafe { bitmap_exec.tid_bitmap_set() };
         if let Some(set) = set {
             state
                 .custom_state_mut()
                 .aggregate_clause
                 .query_mut()
-                .attach_tid_candidate_set(&set);
+                .attach_tid_bitmap_set(&set);
         }
     }
 

@@ -649,7 +649,7 @@ impl From<&Qual> for SearchQueryInput {
                     always_filters,
                     recheck_filters: vec![],
                     uses_tid_bitmap: false,
-                    candidate_set: None,
+                    tid_bitmap_set: None,
                 }
             }
             Qual::And(quals) => {

@@ -48,7 +48,6 @@ static ENABLE_CUSTOM_SCAN_WITHOUT_OPERATOR: GucSetting<bool> = GucSetting::<bool
 /// Allows the user to toggle the use of custom scan for queries that include non-indexed fields.
 /// When enabled, queries with non-indexed predicates will use HeapExpr for heap filtering.
 static ENABLE_FILTER_PUSHDOWN: GucSetting<bool> = GucSetting::<bool>::new(true);
-static ENABLE_BITMAP_INTERSECTION: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Allows the user to enable or disable the FastFieldsExecState executor. Default is `true`.
 static ENABLE_FAST_FIELD_EXEC: GucSetting<bool> = GucSetting::<bool>::new(true);
@@ -340,15 +339,6 @@ pub fn init() {
         c"Enable ParadeDB's custom scan for queries with non-indexed fields",
         c"Enable ParadeDB's custom scan to handle queries that include non-indexed field predicates using HeapExpr for heap filtering. When disabled, such queries will fall back to standard PostgreSQL execution",
         &ENABLE_FILTER_PUSHDOWN,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_bool_guc(
-        c"paradedb.enable_bitmap_intersection",
-        c"Intersect ParadeDB scans with other indexes via bitmap candidate sets",
-        c"When a query mixes BM25 predicates with predicates covered by another index (btree, GIN, GiST), execute that index's bitmap scan and probe its candidate set inside the heap filter, rejecting non-candidate rows without heap access",
-        &ENABLE_BITMAP_INTERSECTION,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -764,10 +754,6 @@ pub fn enable_custom_scan_without_operator() -> bool {
 
 pub fn enable_filter_pushdown() -> bool {
     ENABLE_FILTER_PUSHDOWN.get()
-}
-
-pub fn enable_bitmap_intersection() -> bool {
-    ENABLE_BITMAP_INTERSECTION.get()
 }
 
 pub fn is_fast_field_exec_enabled() -> bool {

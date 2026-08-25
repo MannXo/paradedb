@@ -305,7 +305,7 @@ unsafe extern "C-unwind" fn param_resolver_mutator(
 /// visits whole pages; we probe individual ctids, so conflating them would forfeit
 /// rejection on recheck pages.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct TidCandidateSet {
+pub struct TidBitmapSet {
     pub exact_ctids: Vec<u64>,
     pub lossy_blocks: Vec<u32>,
     pub recheck_blocks: Vec<u32>,
@@ -320,7 +320,7 @@ pub enum TidProbe {
     NeedsRecheck,
 }
 
-impl TidCandidateSet {
+impl TidBitmapSet {
     pub fn probe(&self, ctid: u64) -> TidProbe {
         let block = (ctid >> 16) as u32;
         // Lossy blocks first: `exact_ctids` holds nothing for them, so a membership
@@ -345,7 +345,7 @@ pub struct HeapFilterQuery {
     indexed_query: Box<dyn Query>,
     always_filters: Vec<HeapFieldFilter>,
     recheck_filters: Vec<HeapFieldFilter>,
-    candidate_set: Option<Arc<TidCandidateSet>>,
+    tid_bitmap_set: Option<Arc<TidBitmapSet>>,
     rel_oid: pg_sys::Oid,
     expr_context: NonNull<pg_sys::ExprContext>,
     planstate: Option<NonNull<pg_sys::PlanState>>,
@@ -361,7 +361,7 @@ impl HeapFilterQuery {
         indexed_query: Box<dyn Query>,
         always_filters: Vec<HeapFieldFilter>,
         recheck_filters: Vec<HeapFieldFilter>,
-        candidate_set: Option<Arc<TidCandidateSet>>,
+        tid_bitmap_set: Option<Arc<TidBitmapSet>>,
         rel_oid: pg_sys::Oid,
         expr_context: NonNull<pg_sys::ExprContext>,
         planstate: Option<NonNull<pg_sys::PlanState>>,
@@ -370,7 +370,7 @@ impl HeapFilterQuery {
             indexed_query,
             always_filters,
             recheck_filters,
-            candidate_set,
+            tid_bitmap_set,
             rel_oid,
             expr_context,
             planstate,
@@ -384,7 +384,7 @@ impl tantivy::query::QueryClone for HeapFilterQuery {
             indexed_query: self.indexed_query.box_clone(),
             always_filters: self.always_filters.clone(),
             recheck_filters: self.recheck_filters.clone(),
-            candidate_set: self.candidate_set.clone(),
+            tid_bitmap_set: self.tid_bitmap_set.clone(),
             rel_oid: self.rel_oid,
             expr_context: self.expr_context,
             planstate: self.planstate,
@@ -399,7 +399,7 @@ impl Query for HeapFilterQuery {
             indexed_weight,
             always_filters: self.always_filters.clone(),
             recheck_filters: self.recheck_filters.clone(),
-            candidate_set: self.candidate_set.clone(),
+            tid_bitmap_set: self.tid_bitmap_set.clone(),
             rel_oid: self.rel_oid,
             expr_context: self.expr_context,
             planstate: self.planstate,
@@ -420,7 +420,7 @@ struct HeapFilterWeight {
     indexed_weight: Box<dyn Weight>,
     always_filters: Vec<HeapFieldFilter>,
     recheck_filters: Vec<HeapFieldFilter>,
-    candidate_set: Option<Arc<TidCandidateSet>>,
+    tid_bitmap_set: Option<Arc<TidBitmapSet>>,
     rel_oid: pg_sys::Oid,
     expr_context: NonNull<pg_sys::ExprContext>,
     planstate: Option<NonNull<pg_sys::PlanState>>,
@@ -442,7 +442,7 @@ impl Weight for HeapFilterWeight {
             indexed_scorer,
             self.always_filters.clone(),
             self.recheck_filters.clone(),
-            self.candidate_set.clone(),
+            self.tid_bitmap_set.clone(),
             ctid_ff,
             self.rel_oid,
             self.expr_context,
@@ -461,11 +461,11 @@ impl Weight for HeapFilterWeight {
 struct HeapFilterScorer {
     indexed_scorer: Box<dyn Scorer>,
     /// Evaluated on every doc that survives the bitmap probe (or every doc when no
-    /// candidate set is attached). See `SearchQueryInput::HeapFilter`.
+    /// bitmap set is attached). See `SearchQueryInput::HeapFilter`.
     always_filters: Vec<HeapFieldFilter>,
-    /// Evaluated only for lossy/recheck probes, or when no candidate set is attached.
+    /// Evaluated only for lossy/recheck probes, or when no bitmap set is attached.
     recheck_filters: Vec<HeapFieldFilter>,
-    candidate_set: Option<Arc<TidCandidateSet>>,
+    tid_bitmap_set: Option<Arc<TidBitmapSet>>,
     ctid_ff: crate::index::fast_fields_helper::FFType,
     heaprel: PgSearchRelation,
     current_doc: DocId,
@@ -483,7 +483,7 @@ impl HeapFilterScorer {
         indexed_scorer: Box<dyn Scorer>,
         always_filters: Vec<HeapFieldFilter>,
         recheck_filters: Vec<HeapFieldFilter>,
-        candidate_set: Option<Arc<TidCandidateSet>>,
+        tid_bitmap_set: Option<Arc<TidBitmapSet>>,
         ctid_ff: crate::index::fast_fields_helper::FFType,
         rel_oid: pg_sys::Oid,
         expr_context: NonNull<pg_sys::ExprContext>,
@@ -493,7 +493,7 @@ impl HeapFilterScorer {
             indexed_scorer,
             always_filters,
             recheck_filters,
-            candidate_set,
+            tid_bitmap_set,
             ctid_ff,
             heaprel: PgSearchRelation::open(rel_oid),
             current_doc: TERMINATED,
@@ -528,9 +528,9 @@ impl HeapFilterScorer {
 
         // Probe the external index's bitmap first: a miss rejects the doc with zero
         // heap access, and exact non-recheck membership skips the recheck filters.
-        // With no candidate set attached, both filter lists must run: the bitmap
+        // With no bitmap set attached, both filter lists must run: the bitmap
         // proof the recheck split relies on doesn't exist.
-        let needs_recheck_filters = match &self.candidate_set {
+        let needs_recheck_filters = match &self.tid_bitmap_set {
             Some(set) => match set.probe(ctid_value) {
                 TidProbe::Reject => return false,
                 TidProbe::Candidate => false,

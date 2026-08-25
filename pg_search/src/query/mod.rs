@@ -27,7 +27,7 @@ mod score;
 
 use builder::{QueryBuilder, QueryOnlyBuilder, QueryTreeBuilder};
 use estimate_tree::QueryWithEstimates;
-use heap_field_filter::{HeapFieldFilter, TidCandidateSet};
+use heap_field_filter::{HeapFieldFilter, TidBitmapSet};
 use std::sync::Arc;
 
 use crate::api::FieldName;
@@ -136,7 +136,7 @@ pub enum SearchQueryInput {
     /// Mixed query with indexed search and heap field filters
     HeapFilter {
         indexed_query: Box<SearchQueryInput>,
-        /// Predicates the candidate-set bitmap cannot prove: either no external index
+        /// Predicates the bitmap-set bitmap cannot prove: either no external index
         /// covers them, or the covering index qual is lossy (e.g. `ST_DWithin` matched
         /// only through its bounding-box qual). Evaluated against the heap for every
         /// document that survives the bitmap probe -- and for every document when no
@@ -148,17 +148,17 @@ pub enum SearchQueryInput {
         /// external index exactly (`IndexClause.lossy == false`), so a document found
         /// in the bitmap on an exact, non-recheck page already satisfies them.
         /// Evaluated only when that proof breaks down: a lossy page, a recheck-flagged
-        /// page, or no candidate set attached.
+        /// page, or no bitmap set attached.
         #[serde(default)]
         #[serde(skip_serializing_if = "Vec::is_empty")]
         recheck_filters: Vec<HeapFieldFilter>,
         /// Set at plan time when an external index's bitmap covers this filter's
-        /// clauses; the candidate set itself is attached at execution time.
+        /// clauses; the bitmap set itself is attached at execution time.
         #[serde(default)]
         #[serde(skip_serializing_if = "is_false")]
         uses_tid_bitmap: bool,
         #[serde(skip)]
-        candidate_set: Option<Arc<TidCandidateSet>>,
+        tid_bitmap_set: Option<Arc<TidBitmapSet>>,
     },
 
     #[serde(serialize_with = "serialize_fielded_query")]
@@ -1496,7 +1496,7 @@ impl SearchQueryInput {
                 always_filters,
                 recheck_filters,
                 uses_tid_bitmap: _,
-                candidate_set,
+                tid_bitmap_set,
             } => {
                 // Convert indexed query first
                 let inner_output = recurse(*indexed_query)?;
@@ -1512,7 +1512,7 @@ impl SearchQueryInput {
                     indexed_tantivy_query,
                     always_filters.clone(),
                     recheck_filters.clone(),
-                    candidate_set.clone(),
+                    tid_bitmap_set.clone(),
                     relation_oid.expect("relation_oid is required for HeapFilter queries"),
                     expr_context,
                     planstate,
@@ -2208,7 +2208,7 @@ mod tests {
                 always_filters: vec![],
                 recheck_filters: vec![],
                 uses_tid_bitmap: false,
-                candidate_set: None,
+                tid_bitmap_set: None,
             }
             .is_full_scan_query()
         );
@@ -2289,7 +2289,7 @@ mod tests {
                         always_filters: vec![],
                         recheck_filters: vec![],
                         uses_tid_bitmap: false,
-                        candidate_set: None,
+                        tid_bitmap_set: None,
                     }),
                 }],
                 tie_breaker: None,

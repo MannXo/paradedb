@@ -734,7 +734,7 @@ impl CustomScan for AggregateScan {
         if let Some(bitmap_exec) = state.custom_state().bitmap_exec.as_ref() {
             explainer.add_text("Bitmap Intersection", bitmap_exec.index_name());
             if explainer.is_analyze()
-                && let Some((exact, lossy, recheck)) = bitmap_exec.candidate_stats()
+                && let Some((exact, lossy, recheck)) = bitmap_exec.tid_bitmap_stats()
             {
                 explainer.add_unsigned_integer("Bitmap Exact Candidates", exact as u64, None);
                 explainer.add_unsigned_integer("Bitmap Lossy Blocks", lossy as u64, None);
@@ -1350,29 +1350,27 @@ impl AggregateScan {
                 Self::mark_contexts_successful(unsafe { rte_alias_or_unknown(heap_rte) });
 
                 let mut builder = builder.set_rows(shape.rows());
-                if gucs::enable_bitmap_intersection() {
-                    unsafe {
-                        let root = builder.args().root;
-                        let base_rel = if !(*root).simple_rel_array.is_null()
-                            && (heap_rti as i32) < (*root).simple_rel_array_size
-                        {
-                            *(*root).simple_rel_array.add(heap_rti as usize)
-                        } else {
-                            std::ptr::null_mut()
-                        };
-                        if let Some(harvested) = BitmapPlanner::from_search_query(
-                            root,
-                            base_rel,
-                            index.oid(),
-                            aggregate_clause.query(),
-                        )
-                        .and_then(|planner| planner.harvest())
-                        {
-                            harvested.rewrite_query(aggregate_clause.query_mut());
-                            let mut children = PgList::<pg_sys::Path>::new();
-                            children.push(harvested.path);
-                            builder = builder.set_custom_paths(children);
-                        }
+                unsafe {
+                    let root = builder.args().root;
+                    let base_rel = if !(*root).simple_rel_array.is_null()
+                        && (heap_rti as i32) < (*root).simple_rel_array_size
+                    {
+                        *(*root).simple_rel_array.add(heap_rti as usize)
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    if let Some(harvested) = BitmapPlanner::from_search_query(
+                        root,
+                        base_rel,
+                        index.oid(),
+                        aggregate_clause.query(),
+                    )
+                    .and_then(|planner| planner.harvest())
+                    {
+                        harvested.rewrite_query(aggregate_clause.query_mut());
+                        let mut children = PgList::<pg_sys::Path>::new();
+                        children.push(harvested.path);
+                        builder = builder.set_custom_paths(children);
                     }
                 }
 

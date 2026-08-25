@@ -23,7 +23,7 @@
 //! `harvest` finds or builds a covering `BitmapHeapPath`, which the caller attaches as
 //! a `custom_paths` child and rewrites the covered HeapFilters. Execution time:
 //! `BitmapExec` runs the planned child `BitmapIndexScan` and converts its TIDBitmap
-//! into the `TidCandidateSet` the HeapFilter scorer probes.
+//! into the `TidBitmapSet` the HeapFilter scorer probes.
 //!
 //! Scope: a single `BitmapIndexScan` or `BitmapAnd` tree over top-level AND clauses;
 //! `BitmapOr` is rejected because a single OR arm is not a necessary condition of the
@@ -39,7 +39,7 @@ use crate::postgres::customscan::qual_inspect::Qual;
 use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::{BitmapBuildClaim, ParallelScanState};
 use crate::query::SearchQueryInput;
-use crate::query::heap_field_filter::TidCandidateSet;
+use crate::query::heap_field_filter::TidBitmapSet;
 use pgrx::{PgList, pg_sys};
 use std::sync::Arc;
 
@@ -369,11 +369,11 @@ pub unsafe fn keep_bitmap_child_plan<CS: CustomScan>(builder: &mut CustomScanBui
 
 /// Execution half: owns the initialized child `BitmapIndexScan`/`BitmapAnd` planned
 /// from the harvested path, and converts its TIDBitmap into a probe-able
-/// `TidCandidateSet` on first execution.
+/// `TidBitmapSet` on first execution.
 pub struct BitmapExec {
     child: *mut pg_sys::PlanState,
     consumed: bool,
-    set: Option<Arc<TidCandidateSet>>,
+    set: Option<Arc<TidBitmapSet>>,
 }
 
 impl BitmapExec {
@@ -411,7 +411,7 @@ impl BitmapExec {
     }
 
     /// (exact ctids, lossy blocks, recheck blocks) once the set has been built.
-    pub fn candidate_stats(&self) -> Option<(usize, usize, usize)> {
+    pub fn tid_bitmap_stats(&self) -> Option<(usize, usize, usize)> {
         self.set.as_ref().map(|set| {
             (
                 set.exact_ctids.len(),
@@ -433,23 +433,23 @@ impl BitmapExec {
         self.set = None;
     }
 
-    /// Parallel variant of `candidate_set`: the first participant to arrive builds the
+    /// Parallel variant of `tid_bitmap_set`: the first participant to arrive builds the
     /// set from its own child scan and publishes the flat bytes into the query's DSA;
     /// every other participant waits on the shared state and reads them back.
     /// (Parallel Bitmap Heap Scan's build-once coordination, with our own probe-able
     /// representation instead of a shared TIDBitmap.)
-    pub unsafe fn shared_candidate_set(
+    pub unsafe fn shared_tid_bitmap_set(
         &mut self,
         pstate: *mut ParallelScanState,
         dsa: *mut pg_sys::dsa_area,
-    ) -> Option<Arc<TidCandidateSet>> {
+    ) -> Option<Arc<TidBitmapSet>> {
         unsafe {
             if pstate.is_null() || dsa.is_null() {
-                return self.candidate_set();
+                return self.tid_bitmap_set();
             }
             match (*pstate).bitmap_claim_build() {
                 BitmapBuildClaim::Build => {
-                    let set = self.candidate_set();
+                    let set = self.tid_bitmap_set();
                     let pointer = set.as_deref().map_or(0, |set| publish_to_dsa(dsa, set));
                     (*pstate).bitmap_publish(pointer);
                     set
@@ -461,16 +461,16 @@ impl BitmapExec {
     }
 
     /// Run the child via `MultiExecProcNode` (first execution only) and convert its
-    /// TIDBitmap into a `TidCandidateSet`.
-    pub unsafe fn candidate_set(&mut self) -> Option<Arc<TidCandidateSet>> {
+    /// TIDBitmap into a `TidBitmapSet`.
+    pub unsafe fn tid_bitmap_set(&mut self) -> Option<Arc<TidBitmapSet>> {
         if !self.consumed {
             self.consumed = true;
-            self.set = unsafe { self.build_candidate_set() };
+            self.set = unsafe { self.build_tid_bitmap_set() };
         }
         self.set.clone()
     }
 
-    unsafe fn build_candidate_set(&mut self) -> Option<Arc<TidCandidateSet>> {
+    unsafe fn build_tid_bitmap_set(&mut self) -> Option<Arc<TidBitmapSet>> {
         unsafe {
             let result = pg_sys::MultiExecProcNode(self.child);
             if result.is_null() {
@@ -484,8 +484,8 @@ impl BitmapExec {
             let tbm: *mut pg_sys::TIDBitmap = result.cast();
 
             // TIDBitmap iteration returns pages in block order with ascending offsets,
-            // so the vecs below are built sorted, as `TidCandidateSet::probe` requires.
-            let mut set = TidCandidateSet::default();
+            // so the vecs below are built sorted, as `TidBitmapSet::probe` requires.
+            let mut set = TidBitmapSet::default();
             let pack = |blockno: u32, offset: pg_sys::OffsetNumber| {
                 ((blockno as u64) << 16) | (offset as u64)
             };
@@ -542,7 +542,7 @@ impl BitmapExec {
 
             pg_sys::tbm_free(tbm);
             pgrx::debug1!(
-                "[bitmap_harvest] TidCandidateSet: {} exact ctids, {} lossy blocks, {} recheck blocks",
+                "[bitmap_harvest] TidBitmapSet: {} exact ctids, {} lossy blocks, {} recheck blocks",
                 set.exact_ctids.len(),
                 set.lossy_blocks.len(),
                 set.recheck_blocks.len(),
@@ -721,7 +721,7 @@ unsafe fn build_index_clause(
 
 /// Flat DSA layout: `[exact_len u64][lossy_len u64][recheck_len u64]` followed by the
 /// three arrays. DSA allocations are MAXALIGNed, so the typed copies below are aligned.
-unsafe fn publish_to_dsa(dsa: *mut pg_sys::dsa_area, set: &TidCandidateSet) -> pg_sys::dsa_pointer {
+unsafe fn publish_to_dsa(dsa: *mut pg_sys::dsa_area, set: &TidBitmapSet) -> pg_sys::dsa_pointer {
     unsafe {
         let (ne, nl, nr) = (
             set.exact_ctids.len(),
@@ -750,7 +750,7 @@ unsafe fn publish_to_dsa(dsa: *mut pg_sys::dsa_area, set: &TidCandidateSet) -> p
 unsafe fn read_from_dsa(
     dsa: *mut pg_sys::dsa_area,
     pointer: pg_sys::dsa_pointer,
-) -> Option<Arc<TidCandidateSet>> {
+) -> Option<Arc<TidBitmapSet>> {
     unsafe {
         if pointer == 0 {
             return None;
@@ -761,7 +761,7 @@ unsafe fn read_from_dsa(
         let exact = std::slice::from_raw_parts(base.add(24).cast::<u64>(), ne);
         let lossy = std::slice::from_raw_parts(base.add(24 + ne * 8).cast::<u32>(), nl);
         let recheck = std::slice::from_raw_parts(base.add(24 + ne * 8 + nl * 4).cast::<u32>(), nr);
-        Some(Arc::new(TidCandidateSet {
+        Some(Arc::new(TidBitmapSet {
             exact_ctids: exact.to_vec(),
             lossy_blocks: lossy.to_vec(),
             recheck_blocks: recheck.to_vec(),

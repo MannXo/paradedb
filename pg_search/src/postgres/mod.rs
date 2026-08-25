@@ -700,7 +700,7 @@ pub struct ParallelScanState {
     /// Bitmap-intersection build coordination: 0 = not built, 1 = building,
     /// 2 = done. Protected by `mutex`; waiters sleep on `bitmap_cv`.
     bitmap_build_state: u32,
-    /// DSA pointer to the published flat `TidCandidateSet` bytes; 0 when the build
+    /// DSA pointer to the published flat `TidBitmapSet` bytes; 0 when the build
     /// produced no set. Valid once `bitmap_build_state == 2`.
     bitmap_dsa_pointer: pg_sys::dsa_pointer,
     /// Condition variable for waiting on the bitmap build.
@@ -709,7 +709,7 @@ pub struct ParallelScanState {
     payload: ParallelScanPayload, // must be last field, b/c it allocates on the heap after this struct
 }
 
-/// Outcome of asking to build the shared candidate set.
+/// Outcome of asking to build the shared bitmap set.
 pub enum BitmapBuildClaim {
     /// This participant won the claim and must build + publish.
     Build,

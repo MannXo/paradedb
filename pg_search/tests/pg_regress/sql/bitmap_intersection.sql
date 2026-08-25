@@ -11,7 +11,6 @@ CREATE EXTENSION IF NOT EXISTS pg_search;
 SET client_min_messages = warning;
 
 SET paradedb.enable_filter_pushdown TO on;
-SET paradedb.enable_bitmap_intersection TO on;
 SET max_parallel_workers_per_gather TO 0;
 
 DROP TABLE IF EXISTS providers CASCADE;
@@ -61,8 +60,9 @@ SELECT count(*) AS q1_rows FROM (
       AND location <@ circle(point(50, 50), 5)
 ) q1;
 
--- Same rows with the feature disabled: results must be identical.
-SET paradedb.enable_bitmap_intersection TO off;
+-- Same rows with no intersection source: drop the GiST index so the same custom
+-- scan falls back to plain heap filtering; results must be identical.
+DROP INDEX providers_location;
 SELECT count(*) AS q1_rows_no_bitmap FROM (
     SELECT id FROM providers
     WHERE description @@@ 'cardiology'
@@ -75,7 +75,7 @@ WHERE description @@@ 'cardiology'
   AND gender @@@ 'female'
   AND location <@ circle(point(50, 50), 5)
 ORDER BY id;
-SET paradedb.enable_bitmap_intersection TO on;
+CREATE INDEX providers_location ON providers USING gist (location);
 
 -- Q2 shape: count(*) through the Aggregate Scan with the same predicates.
 EXPLAIN (COSTS OFF)
@@ -95,11 +95,11 @@ WHERE description @@@ 'cardiology'
 SELECT count(*) AS overlap_count FROM providers
 WHERE description @@@ 'cardiology'
   AND service_area && circle(point(50, 50), 1);
-SET paradedb.enable_bitmap_intersection TO off;
+DROP INDEX providers_service_area;
 SELECT count(*) AS overlap_count_no_bitmap FROM providers
 WHERE description @@@ 'cardiology'
   AND service_area && circle(point(50, 50), 1);
-SET paradedb.enable_bitmap_intersection TO on;
+CREATE INDEX providers_service_area ON providers USING gist (service_area);
 
 -- Support-function derivation: LIKE prefix becomes a pattern-ops range on the child,
 -- with the original clause kept as an always-filter.
@@ -137,7 +137,6 @@ DEALLOCATE radius_search;
 RESET plan_cache_mode;
 
 DROP TABLE providers CASCADE;
-RESET paradedb.enable_bitmap_intersection;
 RESET paradedb.enable_filter_pushdown;
 RESET max_parallel_workers_per_gather;
 RESET client_min_messages;

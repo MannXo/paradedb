@@ -129,7 +129,7 @@ impl BaseScan {
             .custom_state_mut()
             .prepare_query_for_execution(planstate, expr_context);
 
-        // Build (or reuse) the external index's candidate set and attach it to the
+        // Build (or reuse) the external index's bitmap set and attach it to the
         // HeapFilters that were planned against it. Must follow
         // `prepare_query_for_execution`, which re-clones the query from its base.
         // Parallel-aware scans build the set once and share it through the query's
@@ -139,12 +139,12 @@ impl BaseScan {
         if let Some(bitmap_exec) = state.custom_state_mut().bitmap_exec.as_mut() {
             let set = unsafe {
                 match parallel_pstate {
-                    Some(pstate) => bitmap_exec.shared_candidate_set(pstate, es_query_dsa),
-                    None => bitmap_exec.candidate_set(),
+                    Some(pstate) => bitmap_exec.shared_tid_bitmap_set(pstate, es_query_dsa),
+                    None => bitmap_exec.tid_bitmap_set(),
                 }
             };
             if let Some(set) = set {
-                state.custom_state_mut().attach_tid_candidate_set(&set);
+                state.custom_state_mut().attach_tid_bitmap_set(&set);
             }
         }
 
@@ -772,17 +772,13 @@ impl CustomScan for BaseScan {
                 return None;
             }
 
-            let harvested_bitmap = if gucs::enable_bitmap_intersection() {
-                bitmap_harvest::BitmapPlanner::from_query(
-                    root,
-                    builder.args().rel,
-                    bm25_index.oid(),
-                    &quals,
-                )
-                .and_then(|planner| planner.harvest())
-            } else {
-                None
-            };
+            let harvested_bitmap = bitmap_harvest::BitmapPlanner::from_query(
+                root,
+                builder.args().rel,
+                bm25_index.oid(),
+                &quals,
+            )
+            .and_then(|planner| planner.harvest());
 
             //
             // ===================
@@ -1478,7 +1474,7 @@ impl CustomScan for BaseScan {
         if let Some(bitmap_exec) = state.custom_state().bitmap_exec.as_ref() {
             explainer.add_text("Bitmap Intersection", bitmap_exec.index_name());
             if explainer.is_analyze()
-                && let Some((exact, lossy, recheck)) = bitmap_exec.candidate_stats()
+                && let Some((exact, lossy, recheck)) = bitmap_exec.tid_bitmap_stats()
             {
                 explainer.add_unsigned_integer("Bitmap Exact Candidates", exact as u64, None);
                 explainer.add_unsigned_integer("Bitmap Lossy Blocks", lossy as u64, None);

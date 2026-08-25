@@ -42,7 +42,7 @@ use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::utils::ExprContextGuard;
 use crate::query::SearchQueryInput;
-use crate::query::heap_field_filter::TidCandidateSet;
+use crate::query::heap_field_filter::TidBitmapSet;
 use crate::schema::SearchIndexSchema;
 use std::sync::Arc;
 
@@ -164,7 +164,7 @@ impl ParallelAggregation {
             },
             agg_req_bytes: serde_json::to_vec(&aggregation)?,
             query_bytes: serde_json::to_vec(query)?,
-            tid_bitmap_bytes: postcard::to_allocvec(&query.tid_candidate_set().as_deref())?,
+            tid_bitmap_bytes: postcard::to_allocvec(&query.tid_bitmap_set().as_deref())?,
             segment_ids,
             ambulkdelete_epoch,
         })
@@ -351,11 +351,10 @@ impl ParallelWorker for ParallelAggregationWorker<'_> {
             .expect("agg_req_bytes should deserialize into an Aggregations");
         let mut query = serde_json::from_slice::<SearchQueryInput>(query_bytes)
             .expect("query_bytes should deserialize into an SearchQueryInput");
-        // The query's serde skips any attached candidate set; reattach it.
-        if let Some(set) = postcard::from_bytes::<Option<TidCandidateSet>>(tid_bitmap_bytes)
-            .expect("tid_bitmap_bytes should deserialize into an Option<TidCandidateSet>")
+        if let Some(set) = postcard::from_bytes::<Option<TidBitmapSet>>(tid_bitmap_bytes)
+            .expect("tid_bitmap_bytes should deserialize into an Option<TidBitmapSet>")
         {
-            query.attach_tid_candidate_set(&Arc::new(set));
+            query.attach_tid_bitmap_set(&Arc::new(set));
         }
         Self {
             state,
