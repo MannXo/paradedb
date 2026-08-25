@@ -2,70 +2,61 @@
 
 We use a single branch, `main`, for our development. Features are built on separate branches and merged into `main` via pull requests.
 
-All releases are **manually triggered** using the [**Publish GitHub Release** workflow](https://github.com/paradedb/paradedb/actions/workflows/publish-github-release.yml) in the GitHub Actions UI.
+ParadeDB uses a **fragment-based workflow** for release artifacts:
+
+- PRs that introduce user-facing changes add a changelog fragment to `docs/changelog/unreleased/<PR>.<category>.mdx`.
+- PRs that modify extension DDL/schema add a SQL migration fragment to `pg_search/sql/unreleased/<PR>.<description>.sql`.
+
+At release time, the [**Publish GitHub Release** workflow](https://github.com/paradedb/paradedb/actions/workflows/publish-github-release.yml) automatically assembles these fragments into the versioned SQL upgrade script and changelog page.
 
 ## Release Types
 
-Releases must always be triggered **from the branch being released** (e.g., `main` for a minor or beta release, or a hotfix branch for patches).
+Releases must always be triggered **from the branch being released** (e.g., `main` for a minor or beta release, or a stable branch for patches).
 
-| Type          | Description                                                                                               |
-| ------------- | --------------------------------------------------------------------------------------------------------- |
-| **Minor**     | Triggered from the `main` branch.                                                                         |
-| **Patch**     | A patch bump off an existing tag (e.g., `v1.4.0 → v1.4.1`).                                               |
-| **Beta (RC)** | Marked with `beta: true`. Produces a prerelease tag like `vX.Y.Z-rc.N`. Requires `-rc.N` in `Cargo.toml`. |
+| Type          | Description                                                                                 |
+| ------------- | ------------------------------------------------------------------------------------------- |
+| **Minor**     | Triggered from the `main` branch.                                                           |
+| **Patch**     | A patch bump off an existing tag (e.g., `v1.4.0 → v1.4.1`) from a stable branch (`0.25.x`). |
+| **Beta (RC)** | Marked with `beta: true`. Produces a prerelease tag like `vX.Y.Z-rc.N`.                     |
 
 > **Note:** Minor and patch releases publish Docker images for all supported PostgreSQL major versions and prebuilt extension binaries for all supported platforms. Beta releases publish only the PostgreSQL 18 Docker image and the Debian 13 packages required to build it; the remaining prebuilt extension binaries are skipped.
 
 ## Workflow Inputs
 
-| Input          | Type    | Default | Description                                                                                    |
-| -------------- | ------- | ------- | ---------------------------------------------------------------------------------------------- |
-| `version`      | string  | `""`    | Target release version in semver format (e.g., `1.2.3` or `1.2.3-rc.1` for beta releases).     |
-| `beta`         | boolean | `false` | If `true`, creates a beta release (`vX.Y.Z-rc.N`) and marks it as a pre-release in GitHub.     |
-| `confirmation` | boolean | `false` | **Required** Confirms that version bump, SQL upgrade script, docs, and changelog are complete. |
-
-> **Note:** The `version` provided _must_ match the version in the `Cargo.toml` file on the branch being released and contain `-rc.X` in the case of a beta release. The workflow will not run unless `confirmation: true`.
-
-## Release Preparation
-
-Before triggering the workflow, create a **Release Preparation PR** against `main`. For a patch release from a stable branch such as `0.25.x`, merge the preparation PR into `main`, backport it to the stable branch, and trigger the release workflow from the stable branch.
-
-- Update the `Cargo.toml` version:
-  - `a.b.c-rc.d` for **beta** releases
-  - `a.b.0` for **minor** releases
-  - `a.b.c` for **patch** releases
-- Run `cargo check` to refresh `Cargo.lock` with the new version.
-- Add a `pg_search--<previous-version>--<upcoming-version>.sql` upgrade script.
-- Update the version references in the deployment and upgrade docs and in `docs/docs.json`.
-- Write a changelog entry and add it to `docs/docs.json`.
-
-See the [0.25.3 release preparation PR](https://github.com/paradedb/paradedb/pull/5982) for an example.
+| Input     | Type    | Default | Description                                                                                |
+| --------- | ------- | ------- | ------------------------------------------------------------------------------------------ |
+| `version` | string  | `""`    | Target release version in semver format (e.g., `1.2.3` or `1.2.3-rc.1` for beta releases). |
+| `beta`    | boolean | `false` | If `true`, creates a beta release (`vX.Y.Z-rc.N`) and marks it as a pre-release in GitHub. |
 
 ## Triggering a Release
 
-### Minor & Beta
+### Minor & Beta Releases
 
 To publish a minor or beta release from `main`:
 
-1. Create and merge the Release Preparation PR
-2. Go to [Actions → Publish GitHub Release](https://github.com/paradedb/paradedb/actions/workflows/publish-github-release.yml)
-3. Click **Run workflow**, select `main` as the release branch, and set your inputs
-4. Click **Run workflow** to start the job, and monitor the progress of the various jobs under the [GitHub Actions UI](https://github.com/paradedb/paradedb/actions)
+1. Go to [Actions → Publish GitHub Release](https://github.com/paradedb/paradedb/actions/workflows/publish-github-release.yml)
+2. Click **Run workflow**, select `main` as the release branch, and provide the target `version` (e.g. `0.26.0` or `0.26.0-rc.1` with `beta: true`).
+3. Click **Run workflow** to start the job.
+4. The workflow will automatically:
+   - Run `scripts/assemble_sql.sh` to assemble `pg_search/sql/unreleased/*.sql` into `pg_search--<prev>--<version>.sql` and remove the consumed fragments.
+   - Run `scripts/assemble_changelog.sh` to assemble `docs/changelog/unreleased/*.mdx` into `docs/changelog/<version>.mdx`, register the page in `docs/docs.json`, and remove the consumed fragments.
+   - Bump `workspace.package.version` in `Cargo.toml` and synchronize `Cargo.lock`.
+   - Commit and push the release commit to `main`.
+   - Create the Git tag `v<version>`, triggering downstream packaging and publishing workflows.
 
-### Patch
+### Patch Releases
 
-To publish a patch for an older release:
+To publish a patch for an existing release:
 
-1. **Branch off** the target tag (e.g. `git checkout -b 0.16.x <release-tag>`), if a stable branch does not already exist
-2. Cherry-pick the fixes you need into the stable branch
-3. Create and merge the Release Preparation PR against `main`, then backport it to the stable branch
-4. Go to [Actions → Publish GitHub Release](https://github.com/paradedb/paradedb/actions/workflows/publish-github-release.yml)
-5. Click **Run workflow**, select the stable branch as the release branch, and set your inputs
+1. **Branch off** the target release if a stable branch does not already exist (e.g., `git checkout -b 0.25.x v0.25.0`).
+2. **Cherry-pick** the required fix commits from `main` into the stable branch. The unreleased fragments associated with those commits will carry over automatically.
+3. Go to [Actions → Publish GitHub Release](https://github.com/paradedb/paradedb/actions/workflows/publish-github-release.yml).
+4. Click **Run workflow**, select the stable branch (e.g. `0.25.x`) as the release branch, and provide the patch `version` (e.g. `0.25.5`).
+5. The workflow will assemble only the fragments present on the stable branch, commit to the stable branch, tag, and publish.
 
 ## Post-Release Steps
 
-1. **Verify** that the GitHub release and tag were created correctly and that all jobs completed successfully.
+1. **Verify** that the GitHub release and tag were created correctly and that all downstream packaging jobs completed successfully.
 2. **Release** `paradedb/paradedb-enterprise` by following the instructions in the repository's RELEASE.md file.
-3. **Open a post-release PR** against the released branch to bump `Cargo.toml` to the next development version (e.g., `0.24.2` after releasing `0.24.1`), add the corresponding empty upgrade script, and run `cargo check` to refresh `Cargo.lock`.
 
 That's it! Go for a walk, you deserve it.

@@ -9,6 +9,7 @@ This document outlines the step-by-step implementation plan for the fragment-bas
 - Create directory `pg_search/sql/unreleased/` (with `.gitkeep`).
 - Create directory `docs/changelog/unreleased/` (with `.gitkeep`).
 - Create `.changelog_headers.json` in the root of the repository mapping categories/header keys to Markdown headers:
+
   ```json
   {
     "features": "## New Features 🚀",
@@ -30,9 +31,11 @@ This document outlines the step-by-step implementation plan for the fragment-bas
 - Resolves the immediately preceding version dynamically (from highest git tag or existing upgrade scripts).
 - Reads and sorts `.sql` files in `pg_search/sql/unreleased/` numerically by PR prefix.
 - Concatenates the fragments into `pg_search/sql/pg_search--<prev>--<new>.sql` with the standard header:
+
   ```sql
   \echo Use "ALTER EXTENSION pg_search UPDATE TO '<new-version>'" to load this file. \quit
   ```
+
 - If `--transient` is passed (used by PR upgrade CI), the unreleased fragment files are preserved.
 - In release mode (without `--transient`), deletes the consumed `.sql` fragments.
 

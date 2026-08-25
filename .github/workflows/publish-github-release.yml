@@ -1,8 +1,8 @@
 # workflows/publish-github-release.yml
 #
 # Publish GitHub Release
-# Publish a ParadeDB GitHub Release, which triggers the entire release process. This workflow
-# is always triggered manually via the GitHub Actions UI and deploys the branch that it is being run from.
+# Orchestrates fragment assembly, version syncing, and publishes a ParadeDB GitHub Release.
+# This workflow is triggered manually via the GitHub Actions UI and deploys the branch that it is being run from.
 
 name: Publish GitHub Release
 
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "The version to release, in semver format (e.g. 0.22.0). This must match the version in Cargo.toml."
+        description: "The version to release, in semver format (e.g. 0.22.0)."
         type: string
         required: true
         default: ""
@@ -18,11 +18,6 @@ on:
         description: "Whether this release is a beta release. Defaults to false."
         type: boolean
         required: false
-        default: false
-      confirmation:
-        description: "I confirm that the version was incremented, the SQL upgrade script was written, and the docs and changelog were updated. Defaults to false."
-        type: boolean
-        required: true
         default: false
 
 concurrency:
@@ -38,23 +33,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Confirm the Pre-Release Checklist Was Completed
-        run: |
-          echo "Confirmation: ${{ github.event.inputs.confirmation }}"
-          if [[ "${{ github.event.inputs.confirmation }}" == "true" ]]; then
-            echo "Thank you for confirming that the version was incremented, the SQL upgrade script was written, and the docs and changelog were updated."
-          else
-            echo "Confirmation failed! Please confirm that the version was incremented, the SQL upgrade script was written, and the docs and changelog were updated."
-            exit 1
-          fi
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ vars.PARADEDB_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PARADEDB_GITHUB_APP_PRIVATE_KEY }}
 
       - name: Checkout Git Repository
         uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
 
-      # We confirm that if the release type is beta, the version in Cargo.toml matches with "-rc.X", and that the
-      # version provided matches the version in Cargo.toml. If the user forgot to increment the version, they will
-      # need to do it in a PR, which will trigger the workflow test_pg_search-upgrade.yml, ensuring that the upgrade is tested.
-      - name: Validate Cargo.toml Version Matches Release Type
+      - name: Validate Release Inputs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -66,25 +58,19 @@ jobs:
           echo "Release check passed!"
 
           if [[ "${{ github.event.inputs.beta }}" == "true" ]]; then
-            echo "Validating that the version in Cargo.toml contains "-rc.X"..."
+            echo "Validating that the version contains '-rc.X'..."
             if [[ "${{ github.event.inputs.version }}" != *"-rc."* ]]; then
-              echo "Version (${{ github.event.inputs.version }}) does not contain "-rc.X" but is marked as a beta release."
+              echo "Version (${{ github.event.inputs.version }}) does not contain '-rc.X' but is marked as a beta release."
               exit 1
             fi
           else
-            echo "Validating that the version in Cargo.toml does not contain "-rc.X"..."
+            echo "Validating that the version does not contain '-rc.X'..."
             if [[ "${{ github.event.inputs.version }}" == *"-rc."* ]]; then
-              echo "Version (${{ github.event.inputs.version }}) contains "-rc.X" but is not marked as a beta release."
+              echo "Version (${{ github.event.inputs.version }}) contains '-rc.X' but is not marked as a beta release."
               exit 1
             fi
           fi
 
-          CARGO_VERSION=$(grep "^version" Cargo.toml | head -1 | awk -F '"' '{print $2}')
-          echo "Validating that the version in Cargo.toml matches the upcoming version..."
-          if [[ "${{ github.event.inputs.version }}" != "$CARGO_VERSION" ]]; then
-            echo "Version in top-level Cargo.toml ($CARGO_VERSION) does not match upcoming version (${{ github.event.inputs.version }})."
-            exit 1
-          fi
           if [[ "${{ github.ref_name }}" == "main" ]]; then
             echo "Validating that the version is a minor release on the main branch..."
             if [[ ! "${{ github.event.inputs.version }}" =~ ^[0-9]+\.[0-9]+\.0(-rc\.[0-9]+)?$ ]]; then
@@ -93,37 +79,47 @@ jobs:
               exit 1
             fi
           fi
-          echo "Version check passed!"
+          echo "Input validation passed!"
 
-      - name: Validate the SQL Upgrade Script Exists
-        working-directory: pg_search/sql/
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+
+      - name: Assemble SQL Upgrade Scripts
         run: |
-          set -euo pipefail
+          ./scripts/assemble_sql.sh "${{ github.event.inputs.version }}"
 
-          target_version="${{ github.event.inputs.version }}"
-          echo "Original target version: ${target_version}"
+      - name: Assemble Changelog
+        run: |
+          ./scripts/assemble_changelog.sh "${{ github.event.inputs.version }}"
 
-          # Strip prerelease suffixes like -rc.1, -beta.2, etc.
-          stripped_version="${target_version%%-*}"
+      - name: Update Cargo Version and Lockfile
+        run: |
+          TARGET_VERSION="${{ github.event.inputs.version }}"
+          # Update version in Cargo.toml
+          python3 -c "
+          import re
+          with open('Cargo.toml', 'r') as f:
+              content = f.read()
+          content = re.sub(r'version = \"[^\"]+\"', f'version = \"${TARGET_VERSION}\"', content, count=1)
+          with open('Cargo.toml', 'w') as f:
+              f.write(content)
+          "
+          cargo check
 
-          echo "Normalized target version (without prerelease tag): ${stripped_version}"
-          echo "Looking for SQL upgrade scripts targeting version: ${stripped_version}"
-
-          # Enable nullglob so an empty glob expands to nothing
-          shopt -s nullglob
-
-          matches=(pg_search--*--"${stripped_version}".sql)
-
-          if (( ${#matches[@]} == 0 )); then
-            echo "❌ No SQL upgrade script found for version ${stripped_version} in $(pwd)."
-            echo "Expected at least one file named: pg_search--<past-version>--${stripped_version}.sql"
-            exit 1
+      - name: Commit and Push Release Artifacts
+        run: |
+          git config user.name "paradedb-github-app[bot]"
+          git config user.email "282009505+paradedb-github-app[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: Prepare \`${{ github.event.inputs.version }}\`."
+            git push origin HEAD:${{ github.ref_name }}
           fi
-
-          echo "✅ Found SQL upgrade script(s):"
-          for f in "${matches[@]}"; do
-            echo " - ${f}"
-          done
 
       - name: Determine if Release Should be Marked as Latest
         id: release_latest
@@ -154,21 +150,6 @@ jobs:
             echo "is_latest=false"
             echo "is_latest=false" >> $GITHUB_OUTPUT
           fi
-
-      # Create the tag ref ourselves, using the GitHub App token, BEFORE
-      # calling softprops/action-gh-release. Since v2.5.0, that action publishes releases
-      # via a draft-first flow where the tag ref is created as a side effect of the
-      # publish API call, which does not emit a cascading `push` event — so our downstream
-      # `publish-*` workflows (triggered on `push: tags: v*`) never fire. Pushing the tag
-      # ref directly with the app token here ensures the push event is attributed to the app and
-      # cascades to the downstream workflows. The subsequent release-creation step then
-      # attaches the release to the already-existing tag.
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v3.2.0
-        with:
-          client-id: ${{ vars.PARADEDB_GITHUB_APP_CLIENT_ID }}
-          private-key: ${{ secrets.PARADEDB_GITHUB_APP_PRIVATE_KEY }}
 
       - name: Create Tag
         env:
