@@ -44,6 +44,7 @@ use crate::postgres::utils::ExprContextGuard;
 use crate::query::SearchQueryInput;
 use crate::query::heap_field_filter::TidCandidateSet;
 use crate::schema::SearchIndexSchema;
+use std::sync::Arc;
 
 use pgrx::{check_for_interrupts, pg_sys};
 use tantivy::aggregation::Key;
@@ -354,7 +355,7 @@ impl ParallelWorker for ParallelAggregationWorker<'_> {
         if let Some(set) = postcard::from_bytes::<Option<TidCandidateSet>>(tid_bitmap_bytes)
             .expect("tid_bitmap_bytes should deserialize into an Option<TidCandidateSet>")
         {
-            query.attach_tid_candidate_set(&std::sync::Arc::new(set));
+            query.attach_tid_candidate_set(&Arc::new(set));
         }
         Self {
             state,

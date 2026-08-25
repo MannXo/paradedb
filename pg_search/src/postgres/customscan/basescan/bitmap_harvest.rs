@@ -33,8 +33,11 @@
 //! re-evaluated on bitmap survivors; a non-lossy original only needs re-evaluation when
 //! the TIDBitmap page's recheck bit is set.
 
+use crate::postgres::customscan::CustomScan;
+use crate::postgres::customscan::builders::custom_scan::CustomScanBuilder;
 use crate::postgres::customscan::qual_inspect::Qual;
 use crate::postgres::rel::PgSearchRelation;
+use crate::postgres::{BitmapBuildClaim, ParallelScanState};
 use crate::query::SearchQueryInput;
 use crate::query::heap_field_filter::TidCandidateSet;
 use pgrx::{PgList, pg_sys};
@@ -351,9 +354,7 @@ impl BitmapPlanner {
 /// path arrives planned as a full BitmapHeapScan; keep only its bitmap-producing
 /// subtree (`BitmapIndexScan` / `BitmapAnd`). Shared by every scan type that carries a
 /// harvested child.
-pub unsafe fn keep_bitmap_child_plan<CS: crate::postgres::customscan::CustomScan>(
-    builder: &mut crate::postgres::customscan::builders::custom_scan::CustomScanBuilder<CS>,
-) {
+pub unsafe fn keep_bitmap_child_plan<CS: CustomScan>(builder: &mut CustomScanBuilder<CS>) {
     unsafe {
         let custom_plans = PgList::<pg_sys::Plan>::from_pg(builder.custom_plans());
         if let Some(child) = custom_plans.get_ptr(0)
@@ -439,10 +440,9 @@ impl BitmapExec {
     /// representation instead of a shared TIDBitmap.)
     pub unsafe fn shared_candidate_set(
         &mut self,
-        pstate: *mut crate::postgres::ParallelScanState,
+        pstate: *mut ParallelScanState,
         dsa: *mut pg_sys::dsa_area,
     ) -> Option<Arc<TidCandidateSet>> {
-        use crate::postgres::BitmapBuildClaim;
         unsafe {
             if pstate.is_null() || dsa.is_null() {
                 return self.candidate_set();

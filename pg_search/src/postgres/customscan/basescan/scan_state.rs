@@ -37,6 +37,8 @@ use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::utils::u64_to_item_pointer;
 use crate::postgres::{ParallelScanArgs, ParallelScanState};
 use crate::query::SearchQueryInput;
+use crate::query::heap_field_filter::TidCandidateSet;
+use std::sync::Arc;
 
 use pgrx::heap_tuple::PgHeapTuple;
 use pgrx::{PgTupleDesc, pg_sys};
@@ -155,10 +157,7 @@ impl BaseScanState {
         self.base_search_query_input = input;
     }
 
-    pub fn attach_tid_candidate_set(
-        &mut self,
-        set: &std::sync::Arc<crate::query::heap_field_filter::TidCandidateSet>,
-    ) {
+    pub fn attach_tid_candidate_set(&mut self, set: &Arc<TidCandidateSet>) {
         self.search_query_input.attach_tid_candidate_set(set);
     }
 
