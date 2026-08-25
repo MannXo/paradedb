@@ -1346,7 +1346,7 @@ impl AggregateScan {
         };
 
         match AggregateCSClause::build(builder, heap_rti, &index) {
-            Ok((mut builder, mut aggregate_clause)) => {
+            Ok((builder, mut aggregate_clause)) => {
                 Self::mark_contexts_successful(unsafe { rte_alias_or_unknown(heap_rte) });
 
                 let mut builder = builder.set_rows(shape.rows());
