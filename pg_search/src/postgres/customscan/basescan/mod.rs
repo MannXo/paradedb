@@ -1474,11 +1474,23 @@ impl CustomScan for BaseScan {
         if let Some(bitmap_exec) = state.custom_state().bitmap_exec.as_ref() {
             explainer.add_text("Bitmap Intersection", bitmap_exec.index_name());
             if explainer.is_analyze()
-                && let Some((exact, lossy, recheck)) = bitmap_exec.tid_bitmap_stats()
+                && let Some(stats) = bitmap_exec.tid_bitmap_stats()
             {
-                explainer.add_unsigned_integer("Bitmap Exact Candidates", exact as u64, None);
-                explainer.add_unsigned_integer("Bitmap Lossy Blocks", lossy as u64, None);
-                explainer.add_unsigned_integer("Bitmap Recheck Blocks", recheck as u64, None);
+                explainer.add_unsigned_integer(
+                    "Bitmap Exact Candidates",
+                    stats.exact_ctids as u64,
+                    None,
+                );
+                explainer.add_unsigned_integer(
+                    "Bitmap Lossy Blocks",
+                    stats.lossy_blocks as u64,
+                    None,
+                );
+                explainer.add_unsigned_integer(
+                    "Bitmap Recheck Blocks",
+                    stats.recheck_blocks as u64,
+                    None,
+                );
             }
         }
         if explainer.is_costs() {

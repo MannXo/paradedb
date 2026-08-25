@@ -43,6 +43,13 @@ use crate::query::heap_field_filter::TidBitmapSet;
 use pgrx::{PgList, pg_sys};
 use std::sync::Arc;
 
+/// Sizes of a built `TidBitmapSet`, surfaced in `EXPLAIN ANALYZE`.
+pub struct TidBitmapStats {
+    pub exact_ctids: usize,
+    pub lossy_blocks: usize,
+    pub recheck_blocks: usize,
+}
+
 pub struct BitmapPlanner {
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
@@ -410,14 +417,12 @@ impl BitmapExec {
         }
     }
 
-    /// (exact ctids, lossy blocks, recheck blocks) once the set has been built.
-    pub fn tid_bitmap_stats(&self) -> Option<(usize, usize, usize)> {
-        self.set.as_ref().map(|set| {
-            (
-                set.exact_ctids.len(),
-                set.lossy_blocks.len(),
-                set.recheck_blocks.len(),
-            )
+    /// Sizes of the built `TidBitmapSet`, if the child scan has run.
+    pub fn tid_bitmap_stats(&self) -> Option<TidBitmapStats> {
+        self.set.as_ref().map(|set| TidBitmapStats {
+            exact_ctids: set.exact_ctids.len(),
+            lossy_blocks: set.lossy_blocks.len(),
+            recheck_blocks: set.recheck_blocks.len(),
         })
     }
 
