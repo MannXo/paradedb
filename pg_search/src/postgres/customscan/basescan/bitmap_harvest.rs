@@ -44,14 +44,14 @@ use pgrx::{PgList, pg_sys};
 use std::sync::Arc;
 
 pub struct TidBitmapStats {
-    /// Row locations the bitmap knows precisely; misses among them are rejected
-    /// without heap access.
+    /// Row locations the bitmap knows precisely; misses are rejected with no heap
+    /// access or filter evaluation at all.
     pub exact_ctids: usize,
-    /// Heap blocks the TIDBitmap degraded under `work_mem` pressure: only "this block
-    /// has matches" survived, so nothing on them can be rejected and all filters run.
+    /// Heap blocks the TIDBitmap degraded under `work_mem` pressure. Membership is
+    /// untestable there: nothing can be rejected, and every row runs all filters.
     pub lossy_blocks: usize,
-    /// Heap blocks whose exact candidates the index AM flagged as approximate matches
-    /// (e.g. GiST bounding boxes); their rows also run the recheck filters.
+    /// Heap blocks whose exact candidates the index AM flagged as approximate matches.
+    /// Absent ctids still reject; present ones also run the recheck filters.
     pub recheck_blocks: usize,
 }
 
