@@ -65,19 +65,28 @@ To allow for automated generation of "flaired" release notes, changelog fragment
   Fixed an issue where blocks could get added to the free space map twice.
   ```
 
-## PR Automation: SchemaBot Enhancement
+## PR Automation
 
-The existing `SchemaBot` workflow (`.github/workflows/check-pg_search-schema-upgrade.yml`) will be enhanced to enforce the creation of SQL fragments.
+### 1. SchemaBot Enhancement (Diff Enforcement)
 
-1. **Detect Change:** The bot will generate a schema diff. This process will involve applying any SQL fragments present in `pg_search/sql/unreleased/` to the generated schema _before_ comparing it to the base schema. This ensures the diff accurately reflects the cumulative schema changes, including those introduced by the fragments.
+The existing `SchemaBot` workflow (`.github/workflows/test-pg_search-schema.yml`) will be enhanced to enforce the creation of SQL fragments:
+
+1. **Detect Change:** The bot generates the DDL schema for the base branch and the PR branch via `cargo pgrx schema`, then runs `pg-schema-diff` to detect any schema difference introduced by the PR.
 2. **Enforce Fragment:** If a schema diff is detected, the bot will:
-   - **Check for a corresponding fragment file** in `pg_search/sql/unreleased/` named `<PR_NUMBER>.*.sql`.
-   - **If the file exists,** it will validate its content against the generated diff. If they don't match, the CI check will fail and instruct the developer to update the file.
-   - **If the file does not exist,** the CI check will fail and the bot will comment on the PR with the expected file content and instructions on how to create it. This keeps the developer in control while using the bot for verification.
+   - **Check for a corresponding fragment file** in `pg_search/sql/unreleased/` matching `<PR_NUMBER>.*.sql`.
+   - **If the file exists,** it will validate that its statements match the generated diff (using `.github/scripts/check_migration_diff.py`). If they don't match, the CI check will fail and instruct the developer to update the fragment.
+   - **If the file does not exist,** the CI check will fail with the expected file content and instructions on how to create it.
+
+### 2. Extension Upgrade Testing (Transient Assembly)
+
+The upgrade testing action (`.github/actions/test-pg_search-upgrade/action.yml`) requires a contiguous upgrade script (`pg_search--<prior>--<current>.sql`) to execute `ALTER EXTENSION pg_search UPDATE`.
+
+- Before compiling and testing `pg_search`, the action will invoke `scripts/assemble_sql.sh` in a non-destructive mode (assembling the unreleased SQL fragments without `git rm`).
+- This allows CI to test `ALTER EXTENSION` and verify that the cumulative unreleased SQL fragments execute cleanly on real databases before the PR merges.
 
 ## Release Automation
 
-The `publish-github-release.yml` workflow will be modified to orchestrate the fragment assembly process. The manual `confirmation` input will be removed. When triggered, the workflow will execute the following steps on the release branch (`main` or a stable branch like `0.19.x`):
+The `publish-github-release.yml` workflow will be modified to orchestrate the fragment assembly process on `workflow_dispatch`. The manual `confirmation` input will be removed. When triggered with a target release version, the workflow executes the following steps on the release branch (`main` or a stable branch like `0.25.x`):
 
 ### Assembly Scripts
 
@@ -93,14 +102,16 @@ Two new scripts will be created to handle the assembly:
    - Finds all `.mdx` files in `docs/changelog/unreleased/`.
    - Groups the content of the fragments based on the `header` key in their frontmatter. If a `header` key is missing, it can fall back to a default based on the filename's category.
    - Creates a new versioned changelog file (`docs/changelog/<new-version>.mdx`), assembling the fragments under their corresponding "flaired" headers.
+   - Updates `docs/docs.json` to insert `"changelog/<new-version>"` into the Mintlify navigation hierarchy.
    - Uses `git rm` to delete the consumed changelog fragments.
 
 ### Workflow Steps
 
-1. **Checkout:** The workflow checks out the code.
-2. **Assemble:** It runs the `assemble_sql.sh` and `assemble_changelog.sh` scripts, providing the new version number.
-3. **Commit:** It commits the newly created artifact files and the deletion of the fragments. This becomes the official "release commit".
-4. **Tag and Publish:** It tags the release commit and proceeds with the rest of the publishing process.
+1. **Checkout & App Auth:** The workflow checks out the release branch and generates a GitHub App installation token (`PARADEDB_GITHUB_APP`) to bypass branch protection rules for the release commit.
+2. **Assemble:** Runs `assemble_sql.sh` and `assemble_changelog.sh` for the target version, creating the versioned artifacts and deleting the consumed fragments.
+3. **Version Sync:** Updates `Cargo.toml` with the release version and runs `cargo check` to synchronize `Cargo.lock`.
+4. **Commit & Push:** Commits the assembled artifacts, manifest updates, version bumps, and fragment deletions, then pushes directly to the release branch.
+5. **Tag & Publish:** Creates the release tag (emitting push events to trigger downstream packaging/publishing workflows) and publishes the GitHub release.
 
 ## 6. Stable Releases and Cherry-Picking
 
@@ -109,5 +120,22 @@ This design is fully compatible with the existing process for stable releases.
 - When a commit with fragments is cherry-picked from `main` to a stable branch, the fragment files are carried with it.
 - The manual release preparation steps performed on the stable branch ensure that the `unreleased` directories on that branch accurately contain _only_ the fragments intended for the upcoming patch release.
 - When the `publish-github-release.yml` workflow is run on the stable branch, the assembly scripts will correctly assemble all fragments present on that branch, creating the correct patch release artifacts. The deletion of fragments on one branch does not impact any other branch.
+
+## Future Work
+
+### Explicit DDL Dependency Ordering (Tiebreakers)
+
+By default, SQL fragments are assembled numerically by PR number prefix. For the vast majority of changes, this simple ordering is sufficient because single PRs contain internally sorted DDL and git lineage naturally sequences cross-PR dependencies.
+
+If an out-of-order dependency arises (e.g., PR #6010 depends on a schema object introduced in PR #6020), an optional in-file directive can be supported in the SQL fragment header:
+
+```sql
+-- after: 6020
+
+DROP FUNCTION IF EXISTS my_func(regclass);
+CREATE FUNCTION my_func(...) ...
+```
+
+When implemented, `assemble_sql.sh` will perform a topological sort respecting `-- after: <PR_NUMBER>` directives while falling back to numeric PR order.
 
 ---
