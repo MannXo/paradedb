@@ -772,14 +772,6 @@ impl CustomScan for BaseScan {
                 return None;
             }
 
-            let harvested_bitmap = bitmap_harvest::BitmapPlanner::from_query(
-                root,
-                builder.args().rel,
-                bm25_index.oid(),
-                &quals,
-            )
-            .and_then(|planner| planner.harvest());
-
             //
             // ===================
             // If we make it this far, we're going to submit a path... it better be a good one!
@@ -879,9 +871,6 @@ impl CustomScan for BaseScan {
             );
 
             let mut query = SearchQueryInput::from(&quals);
-            if let Some(harvested) = &harvested_bitmap {
-                harvested.rewrite_query(&mut query);
-            }
             let norm_selec = if restrict_info.len() == 1 {
                 (*restrict_info.get_ptr(0).unwrap()).norm_selec
             } else {
@@ -950,6 +939,21 @@ impl CustomScan for BaseScan {
                 None => float_limit.unwrap_or(1.0),
             }
             .max(1.0);
+
+            // Harvest a bitmap intersection source now that the drive-side row estimate
+            // exists to feed the cost ledger, and rewrite the covered HeapFilters.
+            let harvested_bitmap = bitmap_harvest::BitmapPlanner::from_query(
+                root,
+                builder.args().rel,
+                bm25_index.oid(),
+                &quals,
+                row_estimate.known_rows().map(|rows| rows as f64),
+            )
+            .and_then(|planner| planner.harvest());
+            if let Some(harvested) = &harvested_bitmap {
+                harvested.rewrite_query(&mut query);
+                custom_private.set_query(query.clone());
+            }
 
             let exec_method_types = choose_exec_method(
                 &custom_private,

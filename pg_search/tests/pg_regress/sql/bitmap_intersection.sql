@@ -113,6 +113,19 @@ SELECT count(*) AS like_count FROM (
     WHERE description @@@ 'cardiology' AND specialty LIKE 'specialty1%'
 ) q;
 
+-- Cost gate: an unselective predicate (every row matches the prefix) makes the
+-- bitmap useless, so the ledger must reject it: no Bitmap Intersection, and the
+-- clause stays a plain always-filter.
+EXPLAIN (COSTS OFF)
+SELECT id FROM providers
+WHERE description @@@ 'cardiology' AND specialty LIKE 'specialty%'
+ORDER BY id LIMIT 5;
+
+SELECT count(*) AS unselective_like_count FROM (
+    SELECT id FROM providers
+    WHERE description @@@ 'cardiology' AND specialty LIKE 'specialty%'
+) q;
+
 -- OR-positioned predicates must not be covered: no Bitmap Intersection in the plan.
 EXPLAIN (COSTS OFF)
 SELECT id FROM providers

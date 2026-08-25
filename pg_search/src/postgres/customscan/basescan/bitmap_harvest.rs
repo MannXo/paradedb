@@ -60,6 +60,9 @@ pub struct BitmapPlanner {
     rel: *mut pg_sys::RelOptInfo,
     bm25_oid: pg_sys::Oid,
     heap_exprs: Vec<*mut pg_sys::Node>,
+    /// Estimated rows the driving BM25 scan will emit, when the caller has one.
+    /// Feeds the cost ledger; without it, harvest falls back to first-match.
+    drive_rows: Option<f64>,
 }
 
 struct HarvestedClause {
@@ -124,6 +127,7 @@ impl BitmapPlanner {
         rel: *mut pg_sys::RelOptInfo,
         bm25_oid: pg_sys::Oid,
         quals: &Qual,
+        drive_rows: Option<f64>,
     ) -> Option<Self> {
         fn collect(qual: &Qual, out: &mut Vec<*mut pg_sys::Node>) -> bool {
             match qual {
@@ -146,6 +150,7 @@ impl BitmapPlanner {
             rel,
             bm25_oid,
             heap_exprs,
+            drive_rows,
         })
     }
 
@@ -158,6 +163,7 @@ impl BitmapPlanner {
         rel: *mut pg_sys::RelOptInfo,
         bm25_oid: pg_sys::Oid,
         query: &SearchQueryInput,
+        drive_rows: Option<f64>,
     ) -> Option<Self> {
         unsafe fn collect(sqi: &SearchQueryInput, out: &mut Vec<*mut pg_sys::Node>) -> bool {
             unsafe {
@@ -207,6 +213,7 @@ impl BitmapPlanner {
             rel,
             bm25_oid,
             heap_exprs,
+            drive_rows,
         })
     }
 
@@ -300,10 +307,13 @@ impl BitmapPlanner {
         }
     }
 
-    /// Build a `BitmapHeapPath` over the first non-BM25 index with at least one key
-    /// column matching a HeapExpr clause.
+    /// Build a `BitmapHeapPath` over the non-BM25 index whose bitmap is worth
+    /// intersecting: every index with a key column matching a HeapExpr clause is
+    /// scored by [`Self::ledger`] and the best positive-net one wins. Without a
+    /// drive-side row estimate the first workable index is taken unscored.
     unsafe fn build_bitmap_path(&self) -> Option<*mut pg_sys::BitmapHeapPath> {
         unsafe {
+            let mut best: Option<(*mut pg_sys::IndexPath, f64)> = None;
             for ioi in PgList::<pg_sys::IndexOptInfo>::from_pg((*self.rel).indexlist).iter_ptr() {
                 if (*ioi).indexoid == self.bm25_oid || !(*ioi).amhasgetbitmap || (*ioi).hypothetical
                 {
@@ -339,17 +349,84 @@ impl BitmapPlanner {
                     1.0,
                     false,
                 );
-                let bhp = pg_sys::create_bitmap_heap_path(
-                    self.root,
-                    self.rel,
-                    ipath.cast(),
-                    (*self.rel).lateral_relids,
-                    1.0,
-                    0,
+                let index_name = PgSearchRelation::open((*ioi).indexoid).name().to_string();
+                if self.overflows_work_mem(ipath) {
+                    pgrx::debug1!(
+                        "[bitmap_harvest] index {index_name}: bitmap would overflow work_mem, skipping"
+                    );
+                    continue;
+                }
+                let Some(drive_rows) = self.drive_rows else {
+                    return Some(self.heap_path(ipath));
+                };
+                let net = self.ledger(ipath, drive_rows);
+                pgrx::debug1!(
+                    "[bitmap_harvest] index {index_name}: net={net:.2} (drive_rows={drive_rows:.0} selectivity={:.6} indextotalcost={:.2})",
+                    (*ipath).indexselectivity,
+                    (*ipath).indextotalcost,
                 );
-                return Some(bhp);
+                if net > 0.0 && best.is_none_or(|(_, b)| net > b) {
+                    best = Some((ipath, net));
+                }
             }
-            None
+            best.map(|(ipath, _)| self.heap_path(ipath))
+        }
+    }
+
+    /// Net benefit of probing this index's bitmap ahead of the heap filters.
+    /// Benefit: each drive-side row the bitmap rejects (the non-selected fraction)
+    /// skips its heap fetch and all heap filter evaluation. Cost: building the
+    /// bitmap (`indextotalcost`) plus converting its entries into the probe-able
+    /// set. Uses the IndexPath's `indextotalcost`/`indexselectivity` rather than a
+    /// BitmapHeapPath's costs, which `cost_bitmap_heap_scan` pollutes with the
+    /// `@@@` qual's huge procost even though only the index child ever executes.
+    unsafe fn ledger(&self, ipath: *mut pg_sys::IndexPath, drive_rows: f64) -> f64 {
+        unsafe {
+            let tuples = (*self.rel).tuples.max(1.0);
+            let pages = (*self.rel).pages as f64;
+            let sel = (*ipath).indexselectivity.clamp(0.0, 1.0);
+            let bitmap_rows = sel * tuples;
+
+            let cpu_tuple_cost = *std::ptr::addr_of!(pg_sys::cpu_tuple_cost);
+            let cpu_operator_cost = *std::ptr::addr_of!(pg_sys::cpu_operator_cost);
+            let random_page_cost = *std::ptr::addr_of!(pg_sys::random_page_cost);
+
+            let mut qual_cost = pg_sys::QualCost::default();
+            let mut exprs = PgList::<pg_sys::Node>::new();
+            for expr in &self.heap_exprs {
+                exprs.push(*expr);
+            }
+            pg_sys::cost_qual_eval(&mut qual_cost, exprs.into_pg(), self.root);
+
+            let per_row_saved =
+                cpu_tuple_cost + qual_cost.per_tuple + (pages / tuples) * random_page_cost;
+            let benefit = drive_rows * (1.0 - sel) * per_row_saved;
+            let cost = (*ipath).indextotalcost + bitmap_rows * 0.1 * cpu_operator_cost;
+            benefit - cost
+        }
+    }
+
+    /// A bitmap whose estimated TID count can't fit in `work_mem` degrades to lossy
+    /// pages, which cannot reject anything.
+    unsafe fn overflows_work_mem(&self, ipath: *mut pg_sys::IndexPath) -> bool {
+        unsafe {
+            let bitmap_rows =
+                (*ipath).indexselectivity.clamp(0.0, 1.0) * (*self.rel).tuples.max(1.0);
+            let work_mem_kb = *std::ptr::addr_of!(pg_sys::work_mem) as f64;
+            bitmap_rows * 8.0 > work_mem_kb * 1024.0
+        }
+    }
+
+    unsafe fn heap_path(&self, ipath: *mut pg_sys::IndexPath) -> *mut pg_sys::BitmapHeapPath {
+        unsafe {
+            pg_sys::create_bitmap_heap_path(
+                self.root,
+                self.rel,
+                ipath.cast(),
+                (*self.rel).lateral_relids,
+                1.0,
+                0,
+            )
         }
     }
 

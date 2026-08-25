@@ -58,6 +58,7 @@ use crate::postgres::customscan::mpp::launch::MppLifecycle;
 use crate::postgres::customscan::mpp::launch::mpp_gated_by_min_rows;
 use crate::postgres::customscan::mpp::worker_fragments::mpp_plan_has_data_parallelism;
 
+use crate::PARAMETERIZED_SELECTIVITY;
 use crate::api::SortDirection;
 use crate::api::agg_funcoid;
 use crate::gucs;
@@ -1371,11 +1372,18 @@ impl AggregateScan {
                     } else {
                         std::ptr::null_mut()
                     };
+                    // `base_rel.rows` already prices in the covered heap quals (and the
+                    // `@@@` clauses), which would double-count what the bitmap saves.
+                    // Use the same drive convention the base scan applies to
+                    // heap-filter queries: reltuples scaled by the parameterized guess.
+                    let drive_rows = (!base_rel.is_null() && (*base_rel).tuples > 0.0)
+                        .then(|| (*base_rel).tuples * PARAMETERIZED_SELECTIVITY);
                     if let Some(harvested) = BitmapPlanner::from_search_query(
                         root,
                         base_rel,
                         index.oid(),
                         aggregate_clause.query(),
+                        drive_rows,
                     )
                     .and_then(|planner| planner.harvest())
                     {

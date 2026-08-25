@@ -186,6 +186,35 @@ SELECT count(*) AS like_count FROM (
        2200
 (1 row)
 
+-- Cost gate: an unselective predicate (every row matches the prefix) makes the
+-- bitmap useless, so the ledger must reject it: no Bitmap Intersection, and the
+-- clause stays a plain always-filter.
+EXPLAIN (COSTS OFF)
+SELECT id FROM providers
+WHERE description @@@ 'cardiology' AND specialty LIKE 'specialty%'
+ORDER BY id LIMIT 5;
+                                                                                                                                                      QUERY PLAN                                                                                                                                                       
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Custom Scan (ParadeDB Base Scan) on providers
+         Table: providers
+         Index: providers_bm25
+         Exec Method: TopKScanExecState
+         Scores: false
+            TopK Order By: id asc
+            TopK Limit: 5
+         Tantivy Query: {"boolean":{"must":[{"heap_filter":{"indexed_query":{"boolean":{"must":[{"with_index":{"query":{"parse_with_field":{"field":"description","query_string":"cardiology","lenient":null,"conjunction_mode":null}}}}]}},"field_filters":[{"heap_filter":"(specialty ~~ 'specialty%'::text)"}]}}]}}
+(9 rows)
+
+SELECT count(*) AS unselective_like_count FROM (
+    SELECT id FROM providers
+    WHERE description @@@ 'cardiology' AND specialty LIKE 'specialty%'
+) q;
+ unselective_like_count 
+------------------------
+                  10000
+(1 row)
+
 -- OR-positioned predicates must not be covered: no Bitmap Intersection in the plan.
 EXPLAIN (COSTS OFF)
 SELECT id FROM providers
