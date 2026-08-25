@@ -967,7 +967,11 @@ impl CustomScan for BaseScan {
             // to decide on parallelism
             //
 
-            let startup_cost = DEFAULT_STARTUP_COST;
+            // The harvested bitmap is built once before the first tuple (and shared
+            // across parallel workers), so its build cost lands in startup, which the
+            // parallel divisor below never touches.
+            let startup_cost =
+                DEFAULT_STARTUP_COST + harvested_bitmap.as_ref().map_or(0.0, |h| h.build_cost);
             let mut custom_paths = Vec::new();
             let parallel_leader_participates = pg_sys::parallel_leader_participation;
             // Seed the cost memo from the open create_custom_path already did for selectivity (if

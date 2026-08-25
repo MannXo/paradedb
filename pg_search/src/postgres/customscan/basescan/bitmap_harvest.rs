@@ -76,6 +76,9 @@ struct HarvestedClause {
 /// HeapExpr clauses its bitmap covers (with their planner-level lossiness).
 pub struct HarvestedBitmap {
     pub path: *mut pg_sys::Path,
+    /// Estimated cost of building the bitmap and converting it into the
+    /// probe-able set; the owning scan should surface it as startup cost.
+    pub build_cost: f64,
     covered: Vec<(*mut pg_sys::Node, bool)>,
 }
 
@@ -221,13 +224,20 @@ impl BitmapPlanner {
     /// scavenging the rel's pathlists is unsound because `add_path` pfrees dominated
     /// non-IndexPath paths, so a harvested pointer could be freed before plan creation.
     pub unsafe fn harvest(&self) -> Option<HarvestedBitmap> {
-        unsafe { self.build_bitmap_path().and_then(|bhp| self.accept(bhp)) }
+        unsafe {
+            self.build_bitmap_path()
+                .and_then(|(bhp, build_cost)| self.accept(bhp, build_cost))
+        }
     }
 
     /// Accept or reject one candidate: walk its bitmapqual tree enforcing the
     /// module-level scope rules, and require that it covers at least one of our
     /// HeapExpr clauses.
-    unsafe fn accept(&self, bhp: *mut pg_sys::BitmapHeapPath) -> Option<HarvestedBitmap> {
+    unsafe fn accept(
+        &self,
+        bhp: *mut pg_sys::BitmapHeapPath,
+        build_cost: f64,
+    ) -> Option<HarvestedBitmap> {
         unsafe {
             // A parameterized path's index quals reference outer rels or nestloop
             // params the custom scan's plan context never supplies.
@@ -298,6 +308,7 @@ impl BitmapPlanner {
             );
             Some(HarvestedBitmap {
                 path: bhp.cast(),
+                build_cost,
                 covered: clauses
                     .into_iter()
                     .filter(|c| c.matched_heap_expr)
@@ -311,7 +322,7 @@ impl BitmapPlanner {
     /// intersecting: every index with a key column matching a HeapExpr clause is
     /// scored by [`Self::ledger`] and the best positive-net one wins. Without a
     /// drive-side row estimate the first workable index is taken unscored.
-    unsafe fn build_bitmap_path(&self) -> Option<*mut pg_sys::BitmapHeapPath> {
+    unsafe fn build_bitmap_path(&self) -> Option<(*mut pg_sys::BitmapHeapPath, f64)> {
         unsafe {
             let mut best: Option<(*mut pg_sys::IndexPath, f64)> = None;
             for ioi in PgList::<pg_sys::IndexOptInfo>::from_pg((*self.rel).indexlist).iter_ptr() {
@@ -357,7 +368,7 @@ impl BitmapPlanner {
                     continue;
                 }
                 let Some(drive_rows) = self.drive_rows else {
-                    return Some(self.heap_path(ipath));
+                    return Some((self.heap_path(ipath), self.bitmap_build_cost(ipath)));
                 };
                 let net = self.ledger(ipath, drive_rows);
                 pgrx::debug1!(
@@ -369,7 +380,18 @@ impl BitmapPlanner {
                     best = Some((ipath, net));
                 }
             }
-            best.map(|(ipath, _)| self.heap_path(ipath))
+            best.map(|(ipath, _)| (self.heap_path(ipath), self.bitmap_build_cost(ipath)))
+        }
+    }
+
+    /// Cost of producing the probe-able set: the index scan that builds the
+    /// TIDBitmap plus converting its entries.
+    unsafe fn bitmap_build_cost(&self, ipath: *mut pg_sys::IndexPath) -> f64 {
+        unsafe {
+            let bitmap_rows =
+                (*ipath).indexselectivity.clamp(0.0, 1.0) * (*self.rel).tuples.max(1.0);
+            let cpu_operator_cost = *std::ptr::addr_of!(pg_sys::cpu_operator_cost);
+            (*ipath).indextotalcost + bitmap_rows * 0.1 * cpu_operator_cost
         }
     }
 
@@ -385,10 +407,8 @@ impl BitmapPlanner {
             let tuples = (*self.rel).tuples.max(1.0);
             let pages = (*self.rel).pages as f64;
             let sel = (*ipath).indexselectivity.clamp(0.0, 1.0);
-            let bitmap_rows = sel * tuples;
 
             let cpu_tuple_cost = *std::ptr::addr_of!(pg_sys::cpu_tuple_cost);
-            let cpu_operator_cost = *std::ptr::addr_of!(pg_sys::cpu_operator_cost);
             let random_page_cost = *std::ptr::addr_of!(pg_sys::random_page_cost);
 
             let mut qual_cost = pg_sys::QualCost::default();
@@ -401,8 +421,7 @@ impl BitmapPlanner {
             let per_row_saved =
                 cpu_tuple_cost + qual_cost.per_tuple + (pages / tuples) * random_page_cost;
             let benefit = drive_rows * (1.0 - sel) * per_row_saved;
-            let cost = (*ipath).indextotalcost + bitmap_rows * 0.1 * cpu_operator_cost;
-            benefit - cost
+            benefit - self.bitmap_build_cost(ipath)
         }
     }
 
