@@ -772,13 +772,17 @@ impl CustomScan for BaseScan {
                 return None;
             }
 
-            let harvested_bitmap = bitmap_harvest::BitmapPlanner::from_query(
-                root,
-                builder.args().rel,
-                bm25_index.oid(),
-                &quals,
-            )
-            .and_then(|planner| planner.harvest());
+            let harvested_bitmap = if gucs::enable_bitmap_intersection() {
+                bitmap_harvest::BitmapPlanner::from_query(
+                    root,
+                    builder.args().rel,
+                    bm25_index.oid(),
+                    &quals,
+                )
+                .and_then(|planner| planner.harvest())
+            } else {
+                None
+            };
 
             //
             // ===================

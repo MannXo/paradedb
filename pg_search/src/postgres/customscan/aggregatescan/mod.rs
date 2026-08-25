@@ -1350,27 +1350,29 @@ impl AggregateScan {
                 Self::mark_contexts_successful(unsafe { rte_alias_or_unknown(heap_rte) });
 
                 let mut builder = builder.set_rows(shape.rows());
-                unsafe {
-                    let root = builder.args().root;
-                    let base_rel = if !(*root).simple_rel_array.is_null()
-                        && (heap_rti as i32) < (*root).simple_rel_array_size
-                    {
-                        *(*root).simple_rel_array.add(heap_rti as usize)
-                    } else {
-                        std::ptr::null_mut()
-                    };
-                    if let Some(harvested) = BitmapPlanner::from_search_query(
-                        root,
-                        base_rel,
-                        index.oid(),
-                        aggregate_clause.query(),
-                    )
-                    .and_then(|planner| planner.harvest())
-                    {
-                        harvested.rewrite_query(aggregate_clause.query_mut());
-                        let mut children = PgList::<pg_sys::Path>::new();
-                        children.push(harvested.path);
-                        builder = builder.set_custom_paths(children);
+                if gucs::enable_bitmap_intersection() {
+                    unsafe {
+                        let root = builder.args().root;
+                        let base_rel = if !(*root).simple_rel_array.is_null()
+                            && (heap_rti as i32) < (*root).simple_rel_array_size
+                        {
+                            *(*root).simple_rel_array.add(heap_rti as usize)
+                        } else {
+                            std::ptr::null_mut()
+                        };
+                        if let Some(harvested) = BitmapPlanner::from_search_query(
+                            root,
+                            base_rel,
+                            index.oid(),
+                            aggregate_clause.query(),
+                        )
+                        .and_then(|planner| planner.harvest())
+                        {
+                            harvested.rewrite_query(aggregate_clause.query_mut());
+                            let mut children = PgList::<pg_sys::Path>::new();
+                            children.push(harvested.path);
+                            builder = builder.set_custom_paths(children);
+                        }
                     }
                 }
 

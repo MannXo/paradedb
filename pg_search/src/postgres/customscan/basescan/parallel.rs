@@ -148,6 +148,7 @@ impl ParallelQueryCapable for BaseScan {
         let pscan_state = coordinate.cast::<ParallelScanState>();
         assert!(!pscan_state.is_null(), "coordinate is null");
         unsafe {
+            (*pscan_state).bitmap_reset();
             (*pscan_state).reset();
         }
     }

@@ -113,9 +113,9 @@ struct ParallelAggregation {
     config: Config,
     query_bytes: Vec<u8>,
     agg_req_bytes: Vec<u8>,
-    /// serde of `Option<TidCandidateSet>`: the query's serde skips the attached
+    /// postcard of `Option<TidCandidateSet>`: the query's serde skips the attached
     /// candidate set (it must not bloat stored plans), so it ships to the workers
-    /// separately (#5702).
+    /// separately, in a compact binary form (#5702).
     candidate_set_bytes: Vec<u8>,
     segment_ids: Vec<(SegmentId, NumDeletedDocs)>,
     ambulkdelete_epoch: u32,
@@ -166,7 +166,7 @@ impl ParallelAggregation {
             },
             agg_req_bytes: serde_json::to_vec(&aggregation)?,
             query_bytes: serde_json::to_vec(query)?,
-            candidate_set_bytes: serde_json::to_vec(&query.tid_candidate_set().as_deref())?,
+            candidate_set_bytes: postcard::to_allocvec(&query.tid_candidate_set().as_deref())?,
             segment_ids,
             ambulkdelete_epoch,
         })
@@ -354,7 +354,7 @@ impl ParallelWorker for ParallelAggregationWorker<'_> {
         let mut query = serde_json::from_slice::<SearchQueryInput>(query_bytes)
             .expect("query_bytes should deserialize into an SearchQueryInput");
         // The query's serde skips any attached candidate set; reattach it (#5702).
-        if let Some(set) = serde_json::from_slice::<Option<TidCandidateSet>>(candidate_set_bytes)
+        if let Some(set) = postcard::from_bytes::<Option<TidCandidateSet>>(candidate_set_bytes)
             .expect("candidate_set_bytes should deserialize into an Option<TidCandidateSet>")
         {
             query.attach_tid_candidate_set(&std::sync::Arc::new(set));

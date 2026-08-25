@@ -1225,13 +1225,17 @@ impl ParallelScanState {
     }
 
     /// Restore the per-source remaining counts for a rescan. Called by amparallelrescan.
-    pub fn reset(&mut self) {
-        // Params may have changed: the bitmap must be rebuilt. The previous DSA
-        // allocation (if any) is intentionally leaked; it is freed with the query's
-        // parallel context.
+    /// Reset the bitmap-build coordination for a parallel rescan. Called only from
+    /// `reinitialize_dsm_custom_scan` (before workers relaunch), never from the
+    /// leader's per-scan `reset()`: wiping there would race a rebuild that already
+    /// published, stranding CV waiters. The previous DSA allocation (if any) is
+    /// intentionally leaked; it is freed with the query's parallel context.
+    pub fn bitmap_reset(&mut self) {
         self.bitmap_build_state = 0;
         self.bitmap_dsa_pointer = 0;
+    }
 
+    pub fn reset(&mut self) {
         // Rescan re-partitions the same way as the initial scan, so reset every source's
         // remaining count back to its initial value.
         let counts: Vec<u32> = self.payload.all_counts().to_vec();

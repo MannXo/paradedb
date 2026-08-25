@@ -76,8 +76,15 @@ impl SearchQueryInput {
     pub fn has_parameters(&self) -> bool {
         let mut found = false;
         self.visit_ref(&mut |sqi| {
-            if let SearchQueryInput::HeapFilter { always_filters, .. } = sqi
-                && always_filters.iter().any(|f| f.has_parameters())
+            if let SearchQueryInput::HeapFilter {
+                always_filters,
+                recheck_filters,
+                ..
+            } = sqi
+                && always_filters
+                    .iter()
+                    .chain(recheck_filters.iter())
+                    .any(|f| f.has_parameters())
             {
                 found = true;
             }
@@ -93,8 +100,12 @@ impl SearchQueryInput {
     pub fn collect_expression_nodes(&mut self) -> Vec<*mut pg_sys::Node> {
         let mut nodes = Vec::new();
         self.visit(&mut |sqi| match sqi {
-            SearchQueryInput::HeapFilter { always_filters, .. } => {
-                for filter in always_filters.iter() {
+            SearchQueryInput::HeapFilter {
+                always_filters,
+                recheck_filters,
+                ..
+            } => {
+                for filter in always_filters.iter().chain(recheck_filters.iter()) {
                     let node = unsafe { filter.get_expression_node() };
                     if !node.is_null() {
                         nodes.push(node);
@@ -164,8 +175,12 @@ impl SearchQueryInput {
                             *sqi = SearchQueryInput::Empty;
                         }
                     }
-                    SearchQueryInput::HeapFilter { always_filters, .. } => {
-                        for filter in always_filters {
+                    SearchQueryInput::HeapFilter {
+                        always_filters,
+                        recheck_filters,
+                        ..
+                    } => {
+                        for filter in always_filters.iter_mut().chain(recheck_filters.iter_mut()) {
                             filter.solve_parameters(expr_context);
                         }
                     }
